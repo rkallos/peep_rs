@@ -154,6 +154,28 @@ defmodule Peep.Storage.RustNIFTest do
     assert Peep.get_all_metrics(name) |> Map.fetch!(gauge) == %{%{} => 10}
   end
 
+  test "an integer distribution value adds to the sum exactly" do
+    dist = Metrics.distribution("rustler.test.dist")
+    name = Peep.Test.start_peep!(storage: @storage, metrics: [dist])
+    value = (1 <<< 53) + 1
+
+    Peep.Test.insert_metric(name, dist, value, %{})
+
+    assert %{%{} => %{sum: ^value}} = Peep.get_all_metrics(name) |> Map.fetch!(dist)
+  end
+
+  test "a distribution value outside 64 bits raises bad_measurement and stores nothing" do
+    dist = Metrics.distribution("rustler.test.dist")
+    name = Peep.Test.start_peep!(storage: @storage, metrics: [dist])
+
+    for value <- [1.0e19, -1.0e19, 1 <<< 64] do
+      error = assert_raise ErlangError, fn -> Peep.Test.insert_metric(name, dist, value, %{}) end
+      assert {:peep_storage_error, :bad_measurement, _} = error.original
+    end
+
+    assert Peep.get_all_metrics(name) == %{}
+  end
+
   test "a calculator's descending boundaries still bucket samples by bound" do
     dist =
       Metrics.distribution("rustler.test.dist",

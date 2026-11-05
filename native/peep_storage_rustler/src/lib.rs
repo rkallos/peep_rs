@@ -474,19 +474,19 @@ fn store_one(
         Some(MetricSlot::Distribution { boundaries, shards }) => {
             let (offset, len) = *boundaries;
             let boundaries = &registered.boundaries_arena[offset..offset + len];
-            let measurement: f64 = value.decode().map_err(|_| {
-                StorageError::BadMeasurement("distribution value must be a number")
-            })?;
-            let make = |measurement: f64| {
+            let measurement = Measurement::decode(value)?;
+            // Before `upsert`, so a rejected value creates no series.
+            let sample = (measurement.as_f64(), measurement.rounded()?);
+            let make = |sample: (f64, i64)| {
                 let cell = DistributionCell::new(len);
-                cell.record(boundaries, measurement);
+                cell.record(boundaries, sample);
                 cell
             };
-            let apply = |cell: &DistributionCell, measurement: f64| {
-                cell.record(boundaries, measurement);
+            let apply = |cell: &DistributionCell, sample: (f64, i64)| {
+                cell.record(boundaries, sample);
             };
 
-            shards.upsert(shard_id, tags, hash, measurement, make, apply);
+            shards.upsert(shard_id, tags, hash, sample, make, apply);
             Ok(())
         }
         None => Err(StorageError::UnknownMetricId(id)),
@@ -663,7 +663,7 @@ fn encode_counter_map<'a>(
         env,
         counters,
         |cell: &AtomicI64| cell.load(Ordering::Relaxed),
-        |total, cell| *total += cell.load(Ordering::Relaxed),
+        |total, cell| *total = total.wrapping_add(cell.load(Ordering::Relaxed)),
     );
 
     encode_merged(env, &combined, "counter map", |env, total| {
@@ -708,9 +708,9 @@ fn encode_distribution_map<'a>(
         },
         |(buckets, sum), cell| {
             for (bucket, cell) in buckets.iter_mut().zip(cell.buckets.iter()) {
-                *bucket += cell.load(Ordering::Relaxed);
+                *bucket = bucket.wrapping_add(cell.load(Ordering::Relaxed));
             }
-            *sum += cell.sum.load(Ordering::Relaxed);
+            *sum = sum.wrapping_add(cell.sum.load(Ordering::Relaxed));
         },
     );
 
@@ -926,10 +926,10 @@ impl DistributionCell {
         }
     }
 
-    fn record(&self, boundaries: &[f64], value: f64) {
+    fn record(&self, boundaries: &[f64], (value, rounded): (f64, i64)) {
         let idx = boundaries.partition_point(|&boundary| boundary <= value);
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add(value.round() as i64, Ordering::Relaxed);
+        self.sum.fetch_add(rounded, Ordering::Relaxed);
     }
 }
 
@@ -1001,7 +1001,35 @@ impl Measurement {
             TermType::Float => term_as_f64(term)
                 .map(Measurement::Float)
                 .ok_or(StorageError::BadMeasurement("float")),
-            _ => Err(StorageError::BadMeasurement("last_value must be a number")),
+            _ => Err(StorageError::BadMeasurement("measurement must be a number")),
+        }
+    }
+
+    /// Bucket bounds are floats, so an integer above 2^53 is bucketed as the
+    /// nearest float.
+    fn as_f64(self) -> f64 {
+        match self {
+            Measurement::Int(int) => int as f64,
+            Measurement::Float(float) => float,
+        }
+    }
+
+    /// The contribution to a distribution's sum. A float is rounded as
+    /// `round/1` does, and one that does not fit in an i64 is rejected rather
+    /// than saturated by `as`.
+    fn rounded(self) -> Result<i64, StorageError> {
+        const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+        match self {
+            Measurement::Int(int) => Ok(int),
+            Measurement::Float(float) => {
+                let rounded = float.round();
+                if (-TWO_POW_63..TWO_POW_63).contains(&rounded) {
+                    Ok(rounded as i64)
+                } else {
+                    Err(StorageError::BadMeasurement("distribution value does not fit in 64 bits"))
+                }
+            }
         }
     }
 }
