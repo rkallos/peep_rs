@@ -1,6 +1,12 @@
 // Never panic; handle our own errors, so we avoid poisoning write locks. Errors
 // should raise exceptions and detach :telemetry handlers.
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented
+)]
 
 use hashbrown::hash_map::{Entry, HashMap, RawEntryMut};
 use hashbrown::HashSet;
