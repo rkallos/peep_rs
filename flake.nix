@@ -22,6 +22,7 @@
             pkgs.rustc
             pkgs.cargo
             pkgs.clippy
+            pkgs.rustfmt
           ];
         };
       }
