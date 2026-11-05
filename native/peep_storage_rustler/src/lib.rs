@@ -2,9 +2,9 @@
 // should raise exceptions and detach :telemetry handlers.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use hashbrown::hash_map::{HashMap, RawEntryMut};
+use hashbrown::hash_map::{Entry, HashMap, RawEntryMut};
 use hashbrown::HashSet;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use rustler::env::OwnedEnv;
 use rustler::sys::{
     enif_get_double, enif_is_identical, enif_make_copy, enif_monotonic_time,
@@ -78,7 +78,7 @@ fn monotonic_time_ns() -> i64 {
 
 struct TagsEnv(OwnedEnv);
 
-// SAFETY: a shard's `RwLock` guards its `TagsEnv`, and the bucket labels'
+// SAFETY: a tag table's `RwLock` guards its `TagsEnv`, and the bucket labels'
 // `TagsEnv` is written only during registration, before `OnceLock` publishes
 // it. `store` is the only operation that allocates and takes `&mut self`, so it
 // never runs while a stored term is being read.
@@ -114,7 +114,8 @@ fn terms_identical(a: NIF_TERM, b: NIF_TERM) -> bool {
 }
 
 /// Wraps rather than copies: sound only for a key `TagsEnv::copy_key` produced
-/// for this same `env`. A key still owned by a shard needs `TagsEnv::copy_out`.
+/// for this same `env`. A key still owned by a tag table needs
+/// `TagsEnv::copy_out`.
 fn tags_term<'a>(env: Env<'a>, key: &TagsKey) -> Term<'a> {
     unsafe { Term::new(env, key.term) }
 }
@@ -159,12 +160,14 @@ struct Storage {
 #[rustler::resource_impl]
 impl Resource for Storage {}
 
-// parking_lot doesn't poison, so it can't assert this for us. Nothing fallible
-// runs inside a critical section, so a guard can't drop mid-unwind.
+// parking_lot doesn't poison, so it can't assert this for us. Nothing inside a
+// critical section panics, so a guard can't drop mid-unwind.
 impl std::panic::RefUnwindSafe for Storage {}
 
 struct RegisteredMetrics {
     metrics: Vec<MetricSlot>,
+    /// One per scheduler, indexed like every metric's shards.
+    tag_tables: Box<[CachePadded<RwLock<TagTable>>]>,
     boundaries_arena: Box<[f64]>,
     /// Parallel to `boundaries_arena`: each bucket's label, owned by `labels_env`.
     labels_arena: Box<[NIF_TERM]>,
@@ -186,19 +189,33 @@ enum MetricSlot {
 #[repr(align(128))]
 struct CachePadded<T>(T);
 
-type ShardMap<V> = HashMap<TagsKey, V, TermHashBuilder>;
+/// Identifies a tags map within one `TagTable`.
+type TagId = u64;
 
-/// One `RwLock` over both: see the SAFETY note on `TagsEnv`.
-struct Shard<V> {
-    map: ShardMap<V>,
-    tags: TagsEnv,
+type IdMap<V> = HashMap<TagId, V, IdHashBuilder>;
+
+/// The tags maps inserted on one scheduler, stored once for every metric.
+/// Metric shards key their series by `TagId`.
+///
+/// Lock a tag table before any metric shard. An insert holds its table's
+/// upgradable lock for the whole batch, and a prune holds the write lock while
+/// it removes ids from the metrics, so an insert never stores under an id that
+/// a prune has removed.
+struct TagTable {
+    env: TagsEnv,
+    ids: HashMap<TagsKey, TagId, TermHashBuilder>,
+    tags: IdMap<TagsKey>,
+    /// Ids are never reused, so an id names one tags map for the table's
+    /// lifetime.
+    next_id: TagId,
 }
 
 struct Shards<V> {
-    shards: Box<[CachePadded<RwLock<Shard<V>>>]>,
+    shards: Box<[CachePadded<RwLock<IdMap<V>>>]>,
 }
 
-const _: () = assert!(size_of::<RwLock<Shard<AtomicI64>>>() <= 128);
+const _: () = assert!(size_of::<RwLock<TagTable>>() <= 128);
+const _: () = assert!(size_of::<RwLock<IdMap<AtomicI64>>>() <= 128);
 
 type LastValueCell = Mutex<(i64, Measurement)>;
 
@@ -281,7 +298,7 @@ fn new(_opts: Term) -> ResourceArc<Storage> {
 // Copies bucket labels into an environment of their own.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rustler::Error> {
-    let n_shards = scheduler_count();
+    let n_shards = scheduler_count().max(1);
     let mut layouts = BucketLayouts::new();
 
     let metrics = get_tuple(ids_to_metrics)
@@ -292,6 +309,9 @@ fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rus
 
     let registered = RegisteredMetrics {
         metrics,
+        tag_tables: (0..n_shards)
+            .map(|_| CachePadded(RwLock::new(TagTable::new())))
+            .collect(),
         boundaries_arena: layouts.boundaries.into_boxed_slice(),
         labels_arena: layouts.labels.into_boxed_slice(),
         labels_env: layouts.labels_env,
@@ -394,19 +414,21 @@ fn insert_metrics(
     tag_results: Term,
     batch: Term,
 ) -> Result<Atom, rustler::Error> {
-    let shard_id = thread_shard();
     let registered = storage.registered.get().ok_or(StorageError::NotRegistered)?;
+    let shard_id = thread_shard() % registered.tag_tables.len();
 
     let tag_terms = TupleElements::new(tag_results)
         .ok_or(StorageError::BadArgument("tag_results must be a tuple"))?;
 
-    // `u64::MAX` is the "not yet computed" sentinel. A `tag_idx` past the end
-    // falls back to hashing per sample.
-    let mut hashes = [u64::MAX; 8];
-
     let batch = batch
         .into_list_iterator()
         .map_err(|_| StorageError::BadArgument("batch must be a list"))?;
+
+    let mut table = registered.tag_tables[shard_id].0.upgradable_read();
+
+    // A batch's metrics usually share a tags map, so each `tag_idx` is resolved
+    // to a `TagId` once. A `tag_idx` past the end is resolved per sample.
+    let mut tag_ids: [Option<TagId>; 8] = [None; 8];
 
     for item in batch {
         // Avoids `Vec<Term>` allocations by `rustler::types::tuple::get_tuple`
@@ -415,38 +437,54 @@ fn insert_metrics(
                 StorageError::BadArgument("batch items must be {id, metric, value, tag_idx} tuples")
             })?;
 
-        let tags = tag_terms
-            .get(tag_idx)
-            .ok_or(StorageError::BadTagIndex(tag_idx))?;
-
-        let hash = match hashes.get_mut(tag_idx) {
-            Some(cached) => {
-                if *cached == u64::MAX {
-                    *cached = tags.hash_internal(0);
-                }
-                *cached
+        let tag_id = || {
+            if let Some(Some(tag_id)) = tag_ids.get(tag_idx) {
+                return Ok(*tag_id);
             }
-            None => tags.hash_internal(0),
+
+            let tags = tag_terms
+                .get(tag_idx)
+                .ok_or(StorageError::BadTagIndex(tag_idx))?;
+            let tag_id = intern(&mut table, tags);
+
+            if let Some(cached) = tag_ids.get_mut(tag_idx) {
+                *cached = Some(tag_id);
+            }
+            Ok(tag_id)
         };
 
-        store_one(registered, shard_id, id, value, tags, hash)?;
+        store_one(registered, shard_id, id, value, tag_id)?;
     }
 
     Ok(rustler::types::atom::ok())
 }
 
+fn intern(table: &mut RwLockUpgradableReadGuard<TagTable>, tags: Term) -> TagId {
+    let hash = tags.hash_internal(0);
+
+    if let Some((_, tag_id)) = table.ids.raw_entry().from_hash(hash, |key| key.matches(tags)) {
+        return *tag_id;
+    }
+
+    // Upgradable locks exclude each other, so no other insert has added `tags`
+    // since the lookup. Upgrading never releases the lock, so no prune runs
+    // before the batch's samples are stored.
+    table.with_upgraded(|table| table.insert(hash, tags))
+}
+
+/// Resolves the sample's `TagId` only once its value is valid, so a rejected
+/// sample stores no tags.
 #[inline]
 fn store_one(
     registered: &RegisteredMetrics,
     shard_id: usize,
     id: usize,
     value: Term,
-    tags: Term,
-    hash: u64,
+    tag_id: impl FnOnce() -> Result<TagId, StorageError>,
 ) -> Result<(), StorageError> {
     match registered.metrics.get(id) {
         Some(MetricSlot::Counter(shards)) => {
-            shards.add(shard_id, tags, hash, 1);
+            shards.add(shard_id, tag_id()?, 1);
             Ok(())
         }
         Some(MetricSlot::Sum(shards)) => {
@@ -454,7 +492,7 @@ fn store_one(
                 .decode()
                 .map_err(|_| StorageError::BadMeasurement("sum value must be an integer"))?;
 
-            shards.add(shard_id, tags, hash, delta);
+            shards.add(shard_id, tag_id()?, delta);
             Ok(())
         }
         Some(MetricSlot::LastValue(shards)) => {
@@ -468,14 +506,13 @@ fn store_one(
                 }
             };
 
-            shards.upsert(shard_id, tags, hash, sample, make, apply);
+            shards.upsert(shard_id, tag_id()?, sample, make, apply);
             Ok(())
         }
         Some(MetricSlot::Distribution { boundaries, shards }) => {
             let (offset, len) = *boundaries;
             let boundaries = &registered.boundaries_arena[offset..offset + len];
             let measurement = Measurement::decode(value)?;
-            // Before `upsert`, so a rejected value creates no series.
             let sample = (measurement.as_f64(), measurement.rounded()?);
             let make = |sample: (f64, i64)| {
                 let cell = DistributionCell::new(len);
@@ -486,7 +523,7 @@ fn store_one(
                 cell.record(boundaries, sample);
             };
 
-            shards.upsert(shard_id, tags, hash, sample, make, apply);
+            shards.upsert(shard_id, tag_id()?, sample, make, apply);
             Ok(())
         }
         None => Err(StorageError::UnknownMetricId(id)),
@@ -512,10 +549,20 @@ fn storage_size(storage: &Storage) -> StorageSize {
     let mut size = 0;
     let mut memory = size_of::<RegisteredMetrics>()
         + registered.boundaries_arena.len() * size_of::<f64>()
-        + registered.labels_arena.len() * size_of::<NIF_TERM>();
+        + registered.labels_arena.len() * size_of::<NIF_TERM>()
+        + registered.tag_tables.len() * size_of::<CachePadded<RwLock<TagTable>>>();
 
     for label in registered.labels_arena.iter() {
         memory += registered.labels_env.size_of(*label);
+    }
+
+    for table in registered.tag_tables.iter() {
+        let table = table.0.read();
+        memory += table.ids.len() * entry_size::<TagsKey, TagId>()
+            + table.tags.len() * entry_size::<TagId, TagsKey>();
+        for key in table.tags.values() {
+            memory += table.env.size_of(key.term);
+        }
     }
 
     for slot in &registered.metrics {
@@ -536,29 +583,27 @@ fn storage_size(storage: &Storage) -> StorageSize {
     StorageSize { size, memory }
 }
 
-fn shards_size_and_memory<V>(
-    shards: &Shards<V>,
-    value_heap_size: impl Fn(&V) -> usize + Copy,
-) -> (usize, usize) {
-    let mut total_size = 0;
-    let mut total_memory = shards.len() * size_of::<CachePadded<RwLock<Shard<V>>>>();
-    for shard in shards.iter() {
-        let (size, memory) = map_size_and_memory(&shard.read(), value_heap_size);
-        total_size += size;
-        total_memory += memory;
-    }
-    (total_size, total_memory)
+/// Counted per entry rather than by allocated capacity, so that every new
+/// series adds to the total. The `1` is hashbrown's control byte.
+fn entry_size<K, V>() -> usize {
+    size_of::<(K, V)>() + 1
 }
 
-fn map_size_and_memory<V>(
-    shard: &Shard<V>,
+fn shards_size_and_memory<V>(
+    shards: &Shards<V>,
     value_heap_size: impl Fn(&V) -> usize,
 ) -> (usize, usize) {
-    let mut memory = shard.map.allocation_size();
-    for (key, value) in shard.map.iter() {
-        memory += shard.tags.size_of(key.term) + value_heap_size(value);
+    let mut total_size = 0;
+    let mut total_memory = shards.len() * size_of::<CachePadded<RwLock<IdMap<V>>>>();
+    for shard in shards.iter() {
+        let map = shard.read();
+        total_size += map.len();
+        total_memory += map.len() * entry_size::<TagId, V>();
+        for value in map.values() {
+            total_memory += value_heap_size(value);
+        }
     }
-    (shard.map.len(), memory)
+    (total_size, total_memory)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -585,9 +630,9 @@ fn nif_get_all_metrics<'a>(
     for (metric_term, slot) in metric_terms.iter().zip(&registered.metrics) {
         let (len, inner) = match slot {
             MetricSlot::Counter(shards) | MetricSlot::Sum(shards) => {
-                encode_counter_map(env, shards)?
+                encode_counter_map(env, registered, shards)?
             }
-            MetricSlot::LastValue(shards) => encode_last_value_map(env, shards)?,
+            MetricSlot::LastValue(shards) => encode_last_value_map(env, registered, shards)?,
             MetricSlot::Distribution { boundaries, shards } => {
                 encode_distribution_map(env, registered, *boundaries, shards)?
             }
@@ -606,13 +651,14 @@ fn nif_get_all_metrics<'a>(
 }
 
 fn combined_capacity<V>(shards: &Shards<V>) -> usize {
-    shards.iter().map(|shard| shard.read().map.len()).max().unwrap_or(0)
+    shards.iter().map(|shard| shard.read().len()).max().unwrap_or(0)
 }
 
-/// The shard's read lock is held for its whole pass, which is what makes
-/// `copy_key` sound: a key never leaves its owning shard uncopied.
+/// The tag table's read lock is held for each shard's whole pass, which is
+/// what makes `copy_key` sound: a key never leaves its table uncopied.
 fn merge_shards<V, A>(
     env: Env,
+    registered: &RegisteredMetrics,
     shards: &Shards<V>,
     init: impl Fn(&V) -> A,
     merge: impl Fn(&mut A, &V),
@@ -620,13 +666,21 @@ fn merge_shards<V, A>(
     let mut combined =
         HashMap::with_capacity_and_hasher(combined_capacity(shards), TermHashBuilder::default());
 
-    for shard in shards.iter() {
-        let shard = shard.read();
-        for (key, cell) in shard.map.iter() {
+    for (table, shard) in registered.tag_tables.iter().zip(shards.iter()) {
+        let table = table.0.read();
+        let map = shard.read();
+
+        for (tag_id, cell) in map.iter() {
+            // Pruning removes an id from the metrics and the table together,
+            // under the table's write lock, so this never skips.
+            let Some(key) = table.tags.get(tag_id) else {
+                continue;
+            };
+
             match combined.raw_entry_mut().from_hash(key.hash, |seen| seen == key) {
                 RawEntryMut::Occupied(mut entry) => merge(entry.get_mut(), cell),
                 RawEntryMut::Vacant(entry) => {
-                    entry.insert(shard.tags.copy_key(env, key), init(cell));
+                    entry.insert(table.env.copy_key(env, key), init(cell));
                 }
             }
         }
@@ -657,10 +711,12 @@ fn encode_merged<'a, A>(
 
 fn encode_counter_map<'a>(
     env: Env<'a>,
+    registered: &RegisteredMetrics,
     counters: &Shards<AtomicI64>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let combined = merge_shards(
         env,
+        registered,
         counters,
         |cell: &AtomicI64| cell.load(Ordering::Relaxed),
         |total, cell| *total = total.wrapping_add(cell.load(Ordering::Relaxed)),
@@ -673,10 +729,12 @@ fn encode_counter_map<'a>(
 
 fn encode_last_value_map<'a>(
     env: Env<'a>,
+    registered: &RegisteredMetrics,
     last_values: &Shards<LastValueCell>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let combined = merge_shards(
         env,
+        registered,
         last_values,
         |cell: &LastValueCell| *cell.lock(),
         |newest, cell| {
@@ -700,6 +758,7 @@ fn encode_distribution_map<'a>(
 ) -> Result<(usize, Term<'a>), StorageError> {
     let combined = merge_shards(
         env,
+        registered,
         distributions,
         |cell: &DistributionCell| {
             let buckets: Vec<u64> =
@@ -755,67 +814,45 @@ fn prune_tags(storage: &Storage, patterns: Term) -> Result<Atom, rustler::Error>
             return Err(StorageError::BadTagsMap.into());
         }
 
-        for slot in &registered.metrics {
-            match slot {
-                MetricSlot::Counter(shards) | MetricSlot::Sum(shards) => {
-                    prune_shards(env, shards, &patterns)
-                }
-                MetricSlot::LastValue(shards) => prune_shards(env, shards, &patterns),
-                MetricSlot::Distribution { shards, .. } => prune_shards(env, shards, &patterns),
-            }
+        for (shard_id, table) in registered.tag_tables.iter().enumerate() {
+            prune_shard(env, registered, shard_id, &mut table.0.write(), &patterns);
         }
     }
 
     Ok(rustler::types::atom::ok())
 }
 
-fn prune_shards<'a, V>(env: Env<'a>, shards: &Shards<V>, patterns: &[Term<'a>]) {
-    for shard_lock in shards.iter() {
-        // Matched under the read lock.
-        let doomed: HashSet<NIF_TERM> = {
-            let shard = shard_lock.read();
-            shard
-                .map
-                .keys()
-                .filter(|key| matches_any_pattern(env, &shard.tags, key, patterns))
-                .map(|key| key.term)
-                .collect()
-        };
+/// The table's write lock is held throughout, so no insert can store under a
+/// removed id after the metrics have dropped it.
+fn prune_shard<'a>(
+    env: Env<'a>,
+    registered: &RegisteredMetrics,
+    shard_id: usize,
+    table: &mut TagTable,
+    patterns: &[Term<'a>],
+) {
+    let doomed: HashSet<TagId, IdHashBuilder> = table
+        .tags
+        .iter()
+        .filter(|(_, key)| matches_any_pattern(env, &table.env, key, patterns))
+        .map(|(tag_id, _)| *tag_id)
+        .collect();
 
-        if doomed.is_empty() {
-            continue;
-        }
-
-        // An environment has no per-term free, so reclaiming means copying the
-        // survivors into a fresh one and dropping the old.
-        let mut shard = shard_lock.write();
-        let Shard { map, tags } = &mut *shard;
-
-        let mut fresh = TagsEnv::new();
-        let mut kept: ShardMap<V> =
-            HashMap::with_capacity_and_hasher(map.len(), TermHashBuilder::default());
-
-        for (key, value) in map.drain() {
-            if doomed.contains(&key.term) {
-                continue;
-            }
-
-            let moved = TagsKey {
-                hash: key.hash,
-                term: fresh.store(key.term),
-            };
-
-            if let RawEntryMut::Vacant(entry) = kept
-                .raw_entry_mut()
-                .from_hash(moved.hash, |seen| seen == &moved)
-            {
-                entry.insert(moved, value);
-            }
-        }
-
-        *map = kept;
-        *tags = fresh;
+    if doomed.is_empty() {
+        return;
     }
+
+    for slot in &registered.metrics {
+        match slot {
+            MetricSlot::Counter(shards) | MetricSlot::Sum(shards) => {
+                shards.remove(shard_id, &doomed)
+            }
+            MetricSlot::LastValue(shards) => shards.remove(shard_id, &doomed),
+            MetricSlot::Distribution { shards, .. } => shards.remove(shard_id, &doomed),
+        }
+    }
+
+    table.remove(&doomed);
 }
 
 fn matches_any_pattern<'a>(
@@ -837,20 +874,66 @@ fn matches_any_pattern<'a>(
 //                                   shards                                  //
 ///////////////////////////////////////////////////////////////////////////////
 
+impl TagTable {
+    fn new() -> Self {
+        TagTable {
+            env: TagsEnv::new(),
+            ids: HashMap::default(),
+            tags: HashMap::default(),
+            next_id: 0,
+        }
+    }
+
+    fn insert(&mut self, hash: u64, tags: Term) -> TagId {
+        let key = TagsKey {
+            hash,
+            term: self.env.store(tags.as_c_arg()),
+        };
+        let tag_id = self.next_id;
+        self.next_id += 1;
+
+        self.ids.insert(key, tag_id);
+        self.tags.insert(tag_id, key);
+        tag_id
+    }
+
+    /// An environment has no per-term free, so reclaiming means copying the
+    /// survivors into a fresh one and dropping the old. Survivors keep their
+    /// ids, so the metrics' entries for them stay valid.
+    fn remove(&mut self, doomed: &HashSet<TagId, IdHashBuilder>) {
+        let mut env = TagsEnv::new();
+        let capacity = self.tags.len();
+        let mut ids = HashMap::with_capacity_and_hasher(capacity, TermHashBuilder::default());
+        let mut tags = HashMap::with_capacity_and_hasher(capacity, IdHashBuilder::default());
+
+        for (tag_id, key) in self.tags.iter() {
+            if doomed.contains(tag_id) {
+                continue;
+            }
+
+            let moved = TagsKey {
+                hash: key.hash,
+                term: env.store(key.term),
+            };
+            ids.insert(moved, *tag_id);
+            tags.insert(*tag_id, moved);
+        }
+
+        self.env = env;
+        self.ids = ids;
+        self.tags = tags;
+    }
+}
+
 impl<V> Shards<V> {
     fn new(n_shards: usize) -> Self {
-        let shards = (0..n_shards.max(1))
-            .map(|_| {
-                CachePadded(RwLock::new(Shard {
-                    map: HashMap::default(),
-                    tags: TagsEnv::new(),
-                }))
-            })
+        let shards = (0..n_shards)
+            .map(|_| CachePadded(RwLock::new(HashMap::default())))
             .collect();
         Shards { shards }
     }
 
-    fn iter(&self) -> impl Iterator<Item = &RwLock<Shard<V>>> {
+    fn iter(&self) -> impl Iterator<Item = &RwLock<IdMap<V>>> {
         self.shards.iter().map(|shard| &shard.0)
     }
 
@@ -858,16 +941,15 @@ impl<V> Shards<V> {
         self.shards.len()
     }
 
-    fn shard(&self, shard_id: usize) -> &RwLock<Shard<V>> {
-        &self.shards[shard_id % self.shards.len()].0
+    fn shard(&self, shard_id: usize) -> &RwLock<IdMap<V>> {
+        &self.shards[shard_id].0
     }
 
     /// Exactly one of `make` and `apply` runs.
     fn upsert<S>(
         &self,
         shard_id: usize,
-        tags: Term,
-        hash: u64,
+        tag_id: TagId,
         sample: S,
         make: impl FnOnce(S) -> V,
         apply: impl FnOnce(&V, S),
@@ -875,39 +957,30 @@ impl<V> Shards<V> {
         let shard_lock = self.shard(shard_id);
 
         // Fast path.
-        {
-            let shard = shard_lock.read();
-            if let Some((_, value)) = shard.map.raw_entry().from_hash(hash, |key| key.matches(tags))
-            {
-                apply(value, sample);
-                return;
-            }
+        if let Some(value) = shard_lock.read().get(&tag_id) {
+            apply(value, sample);
+            return;
         }
 
-        // Slow path: the copy allocates into the shard's environment.
-        let mut shard = shard_lock.write();
-        let Shard { map, tags: env } = &mut *shard;
-
-        match map.raw_entry_mut().from_hash(hash, |key| key.matches(tags)) {
-            RawEntryMut::Occupied(entry) => apply(entry.into_mut(), sample),
-            RawEntryMut::Vacant(entry) => {
-                let key = TagsKey {
-                    hash,
-                    term: env.store(tags.as_c_arg()),
-                };
-                entry.insert(key, make(sample));
+        match shard_lock.write().entry(tag_id) {
+            Entry::Occupied(entry) => apply(entry.get(), sample),
+            Entry::Vacant(entry) => {
+                entry.insert(make(sample));
             }
         }
+    }
+
+    fn remove(&self, shard_id: usize, doomed: &HashSet<TagId, IdHashBuilder>) {
+        self.shard(shard_id).write().retain(|tag_id, _| !doomed.contains(tag_id));
     }
 }
 
 impl Shards<AtomicI64> {
     #[inline]
-    fn add(&self, shard_id: usize, tags: Term, hash: u64, delta: i64) {
+    fn add(&self, shard_id: usize, tag_id: TagId, delta: i64) {
         self.upsert(
             shard_id,
-            tags,
-            hash,
+            tag_id,
             delta,
             AtomicI64::new,
             |counter: &AtomicI64, delta| {
@@ -956,8 +1029,28 @@ impl Hasher for TermPassthroughHasher {
 
 type TermHashBuilder = BuildHasherDefault<TermPassthroughHasher>;
 
-/// `term` lives in the owning shard's `TagsEnv` and is valid only while that
-/// shard's lock is held.
+/// `TagId`s are sequential, so spread them across the bits hashbrown uses.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _bytes: &[u8]) {
+        unreachable!("TagId is the only key type, and it hashes via write_u64")
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type IdHashBuilder = BuildHasherDefault<IdHasher>;
+
+/// `term` lives in the owning tag table's `TagsEnv` and is valid only while
+/// that table's lock is held.
 #[derive(Clone, Copy)]
 struct TagsKey {
     hash: u64,

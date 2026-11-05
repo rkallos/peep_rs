@@ -122,6 +122,78 @@ defmodule Peep.Storage.RustNIFTest do
     assert series == %{%{code: 16.0} => 1, %{code: 16} => 1}
   end
 
+  test "a rejected sample stores no tags" do
+    sum = Metrics.sum("rustler.test.sum")
+    name = Peep.Test.start_peep!(storage: @storage, metrics: [sum])
+    before = Peep.storage_size(name)
+
+    assert_raise ErlangError, fn -> Peep.Test.insert_metric(name, sum, 1.5, %{new: :tags}) end
+
+    assert Peep.storage_size(name) == before
+  end
+
+  test "pruning keeps every metric's surviving series, and pruned tags can return" do
+    counter = Metrics.counter("rustler.test.counter")
+    sum = Metrics.sum("rustler.test.sum")
+    name = Peep.Test.start_peep!(storage: @storage, metrics: [counter, sum])
+
+    for tags <- [%{route: "a"}, %{route: "b"}], metric <- [counter, sum] do
+      Peep.Test.insert_metric(name, metric, 3, tags)
+    end
+
+    Peep.prune_tags(name, [%{route: "a"}])
+
+    assert Peep.get_all_metrics(name) == %{
+             counter => %{%{route: "b"} => 1},
+             sum => %{%{route: "b"} => 3}
+           }
+
+    Peep.Test.insert_metric(name, counter, 1, %{route: "a"})
+
+    assert Peep.get_all_metrics(name) |> Map.fetch!(counter) == %{
+             %{route: "a"} => 1,
+             %{route: "b"} => 1
+           }
+  end
+
+  test "inserts, prunes and scrapes can run concurrently" do
+    counter = Metrics.counter("rustler.test.counter")
+    sum = Metrics.sum("rustler.test.sum")
+    name = Peep.Test.start_peep!(storage: @storage, metrics: [counter, sum])
+    {mod, storage} = Peep.Persistent.storage(name)
+    ids = Peep.Persistent.ids_to_metrics(Peep.Persistent.fetch(name))
+    batch = [{0, elem(ids, 0), 1, 0}, {1, elem(ids, 1), 1, 0}]
+    deadline = System.monotonic_time(:millisecond) + 300
+
+    until_deadline = fn fun ->
+      fn ->
+        Stream.repeatedly(fun)
+        |> Stream.take_while(fn _ -> System.monotonic_time(:millisecond) < deadline end)
+        |> Stream.run()
+      end
+    end
+
+    inserters =
+      for _ <- 1..System.schedulers_online() do
+        until_deadline.(fn ->
+          tags = %{route: Enum.random(1..20)}
+          :ok = mod.insert_metrics(mod.resolve(storage), {tags}, batch)
+        end)
+      end
+
+    pruner = until_deadline.(fn -> Peep.prune_tags(name, [%{route: Enum.random(1..20)}]) end)
+    scraper = until_deadline.(fn -> Peep.get_all_metrics(name) end)
+
+    [pruner, scraper | inserters]
+    |> Enum.map(&Task.async/1)
+    |> Task.await_many(10_000)
+
+    Peep.prune_tags(name, for(route <- 1..20, do: %{route: route}))
+
+    assert Peep.get_all_metrics(name) == %{}
+    assert %{size: 0} = Peep.storage_size(name)
+  end
+
   test "a float measurement on a Sum raises bad_measurement" do
     sum = Metrics.sum("rustler.test.sum")
     name = Peep.Test.start_peep!(storage: @storage, metrics: [sum])
