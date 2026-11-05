@@ -1,10 +1,7 @@
 //! Safe wrappers over the erl_nif calls Rustler doesn't wrap the way this
 //! crate needs.
 
-use rustler::sys::{
-    enif_get_double, enif_is_identical, enif_monotonic_time, enif_system_info, ErlNifSysInfo,
-    ErlNifTimeUnit,
-};
+use rustler::sys::{enif_get_double, enif_is_identical, enif_system_info, ErlNifSysInfo};
 use rustler::wrapper::NIF_TERM;
 use rustler::{Env, Term};
 use std::mem::size_of;
@@ -15,10 +12,6 @@ pub fn scheduler_count() -> usize {
         enif_system_info(&mut info, size_of::<ErlNifSysInfo>());
     }
     info.scheduler_threads as usize
-}
-
-pub fn monotonic_time_ns() -> i64 {
-    unsafe { enif_monotonic_time(ErlNifTimeUnit::ERL_NIF_NSEC) }
 }
 
 /// Whether two terms are `=:=`. The terms may belong to different

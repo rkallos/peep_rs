@@ -9,7 +9,6 @@
 use crate::atoms;
 use crate::distribution::{self, Layout, Layouts, Totals};
 use crate::error::StorageError;
-use crate::ffi::monotonic_time_ns;
 use crate::measurement::Measurement;
 use crate::per_scheduler::PerScheduler;
 use crate::tags::{entry_size, Batch, Doomed, IdMap, Reader, TagId};
@@ -20,6 +19,7 @@ use rustler::{Atom, Encoder as _, Env, Term};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// The registered metrics, indexed by Peep's metric id.
 pub struct Metrics {
@@ -41,8 +41,10 @@ enum Series {
 
 type Shards<V> = PerScheduler<RwLock<IdMap<V>>>;
 
-/// A `last_value` timestamp and measurement.
-type LastValueCell = Mutex<(i64, Measurement)>;
+/// A `last_value` timestamp and measurement. The OS clock rather than
+/// `enif_monotonic_time`, which adds ERTS's time correction: ordering samples
+/// needs only a clock that is monotonic across threads.
+type LastValueCell = Mutex<(Instant, Measurement)>;
 
 const _: () = assert!(size_of::<RwLock<IdMap<AtomicI64>>>() <= 128);
 
@@ -136,8 +138,8 @@ impl Metrics {
                 Ok(())
             }
             Some(Series::LastValue(shards)) => {
-                let sample = (monotonic_time_ns(), Measurement::decode(value)?);
-                let apply = |cell: &LastValueCell, sample: (i64, Measurement)| {
+                let sample = (Instant::now(), Measurement::decode(value)?);
+                let apply = |cell: &LastValueCell, sample: (Instant, Measurement)| {
                     let mut current = cell.lock();
                     if sample.0 > current.0 {
                         *current = sample;
@@ -272,14 +274,14 @@ impl Metric {
 /// A series' value on one scheduler, as a scrape reads it.
 pub enum Sample<'a> {
     Count(i64),
-    LastValue((i64, Measurement)),
+    LastValue((Instant, Measurement)),
     Distribution(&'a distribution::Cell),
 }
 
 /// A series' value merged across schedulers.
 pub enum Merged {
     Count(i64),
-    LastValue((i64, Measurement)),
+    LastValue((Instant, Measurement)),
     Distribution(Totals),
 }
 
