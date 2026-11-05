@@ -1,20 +1,24 @@
-# Scrape time for Peep.Storage.RustNIF.
+# Scrape cost for Peep.Storage.RustNIF.
 #
 # A counter, a sum, a last_value and two distributions share `--series` tags
 # maps, each inserted from every scheduler. One distribution uses
 # Peep.Buckets.PowersOfTen (11 keys per bucket map), the other the default
-# exponential buckets up to 1000 (38 keys). Reports the median of `--runs`
-# scrapes.
+# exponential buckets up to 1000 (38 keys). Erlang builds maps of up to 32 keys
+# differently from larger ones.
 #
-#     MIX_ENV=prod mix run bench/scrape.exs [--series N] [--runs N]
+#     mix run bench/scrape.exs [--series N]
 #
-# Compare medians across interleaved runs of the revisions being compared.
+# To compare revisions, run each with `--save PATH --tag NAME`, then run the
+# last one with `--load PATH` as well.
 
 alias Telemetry.Metrics
 
-{opts, _, _} = OptionParser.parse(System.argv(), strict: [series: :integer, runs: :integer])
+{opts, _, _} =
+  OptionParser.parse(System.argv(),
+    strict: [series: :integer, save: :string, tag: :string, load: :string]
+  )
+
 series = Keyword.get(opts, :series, 5000)
-runs = Keyword.get(opts, :runs, 21)
 
 metrics = [
   Metrics.counter("bench.scrape.counter", tags: [:route]),
@@ -29,7 +33,6 @@ metrics = [
 
 name = :scrape_bench
 {:ok, _} = Peep.start_link(name: name, storage: {Peep.Storage.RustNIF, []}, metrics: metrics)
-
 {mod, storage} = Peep.Persistent.storage(name)
 
 batch =
@@ -54,13 +57,14 @@ batch =
 end)
 |> Task.await_many(:infinity)
 
-Peep.get_all_metrics(name)
+comparison =
+  Enum.flat_map(opts, fn
+    {:save, path} -> [save: [path: path, tag: Keyword.get(opts, :tag, "run")]]
+    {:load, path} -> [load: path]
+    _ -> []
+  end)
 
-times =
-  for _ <- 1..runs do
-    {us, _} = :timer.tc(fn -> Peep.get_all_metrics(name) end)
-    us
-  end
-
-median = times |> Enum.sort() |> Enum.at(div(runs, 2))
-IO.puts(:io_lib.format("scrape ~.2f ms (median of ~B)", [median / 1000, runs]))
+Benchee.run(
+  %{"get_all_metrics/1" => fn -> Peep.get_all_metrics(name) end},
+  [warmup: 2, time: 10] ++ comparison
+)
