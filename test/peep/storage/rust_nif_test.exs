@@ -29,131 +29,211 @@ defmodule Peep.Storage.RustNIFTest do
 
   @storage {Peep.Storage.RustNIF, []}
 
-  describe "tag values" do
-    setup do
-      counter = Metrics.counter("rustler.test.counter", tags: [:tag])
-      name = Peep.Test.start_peep!(storage: @storage, metrics: [counter])
-      %{counter: counter, name: name}
+  # Tags are copied into a process-independent environment rather than decoded
+  # into Rust, so the set of storable terms is whatever `enif_make_copy`
+  # accepts, and these round-trip byte for byte.
+  for {label, tags} <- [
+        {"list", %{tag: ["a", "b"]}},
+        {"tuple", %{tag: {1, 2}}},
+        {"map", %{tag: %{a: 1}}},
+        {"nested", %{tag: [%{a: {1, [2]}}, :b]}},
+        {"pid", %{tag: :self}},
+        {"reference", %{tag: :make_ref}},
+        {"bignum", %{tag: 1 <<< 70}},
+        {"bitstring", %{tag: <<1::size(3)>>}},
+        {"charlist", %{tag: ~c"abc"}},
+        {"empty", %{}}
+      ] do
+    test "a #{label} tag value round-trips" do
+      counter = Metrics.counter("rustler.test.counter")
+      tags = resolve_tags(unquote(Macro.escape(tags)))
+
+      check(
+        metrics: [counter],
+        ops: [insert: {counter, 1, tags}, insert: {counter, 1, tags}],
+        exp_metrics: %{counter => %{tags => 2}}
+      )
     end
+  end
 
-    # Tags are copied into a process-independent environment rather than decoded
-    # into Rust, so the set of storable terms is whatever `enif_make_copy`
-    # accepts, and these round-trip byte for byte.
-    for {label, tags} <- [
-          {"list", %{tag: ["a", "b"]}},
-          {"tuple", %{tag: {1, 2}}},
-          {"map", %{tag: %{a: 1}}},
-          {"nested", %{tag: [%{a: {1, [2]}}, :b]}},
-          {"pid", %{tag: :self}},
-          {"reference", %{tag: :make_ref}},
-          {"bignum", %{tag: 1 <<< 70}},
-          {"bitstring", %{tag: <<1::size(3)>>}},
-          {"charlist", %{tag: ~c"abc"}},
-          {"empty", %{}}
-        ] do
-      test "a #{label} tag value round-trips", %{counter: counter, name: name} do
-        tags = resolve_tags(unquote(Macro.escape(tags)))
+  test "a non-atom tag key round-trips" do
+    counter = Metrics.counter("rustler.test.counter")
+    tags = %{"str" => 1, 2 => :two}
 
-        Peep.Test.insert_metric(name, counter, 1, tags)
-        Peep.Test.insert_metric(name, counter, 1, tags)
+    check(
+      metrics: [counter],
+      ops: [insert: {counter, 1, tags}],
+      exp_metrics: %{counter => %{tags => 1}}
+    )
+  end
 
-        assert Peep.get_all_metrics(name) |> Map.fetch!(counter) == %{tags => 2}
-        assert %{size: 1, memory: memory} = Peep.storage_size(name)
-        assert memory > 0
-      end
-    end
+  test "terms that are == but not =:= stay distinct" do
+    counter = Metrics.counter("rustler.test.counter")
+    tags = [%{tag: [1]}, %{tag: [1.0]}, %{tag: {1}}, %{tag: {1.0}}]
 
-    test "a non-atom tag key round-trips", %{counter: counter, name: name} do
-      tags = %{"str" => 1, 2 => :two}
-
-      Peep.Test.insert_metric(name, counter, 1, tags)
-
-      assert Peep.get_all_metrics(name) |> Map.fetch!(counter) == %{tags => 1}
-    end
-
-    test "terms that are == but not =:= stay distinct", %{counter: counter, name: name} do
-      for tags <- [%{tag: [1]}, %{tag: [1.0]}, %{tag: {1}}, %{tag: {1.0}}] do
-        Peep.Test.insert_metric(name, counter, 1, tags)
-      end
-
-      assert Peep.get_all_metrics(name) |> Map.fetch!(counter) == %{
-               %{tag: [1]} => 1,
-               %{tag: [1.0]} => 1,
-               %{tag: {1}} => 1,
-               %{tag: {1.0}} => 1
-             }
-    end
-
-    test "maps built in different orders are one series", %{counter: counter, name: name} do
-      wide = Map.new(1..40, fn n -> {n, n} end)
-
-      Peep.Test.insert_metric(name, counter, 1, wide)
-      Peep.Test.insert_metric(name, counter, 1, Map.new(Enum.reverse(Map.to_list(wide))))
-
-      assert Peep.get_all_metrics(name) |> Map.fetch!(counter) == %{wide => 2}
-    end
-
-    test "prune_tags matches an exotic tag value", %{counter: counter, name: name} do
-      Peep.Test.insert_metric(name, counter, 1, %{tag: ["a", "b"]})
-      Peep.Test.insert_metric(name, counter, 1, %{tag: ["c"]})
-
-      Peep.prune_tags(name, [%{tag: ["a", "b"]}])
-
-      assert Peep.get_all_metrics(name) |> Map.fetch!(counter) == %{%{tag: ["c"]} => 1}
-    end
-
-    test "prune_tags rejects a non-map pattern", %{name: name} do
-      error = assert_raise ErlangError, fn -> Peep.prune_tags(name, [:not_a_map]) end
-      assert {:peep_storage_error, :bad_tags_map, _} = error.original
-    end
+    check(
+      metrics: [counter],
+      ops: for(t <- tags, do: {:insert, {counter, 1, t}}),
+      exp_metrics: %{counter => Map.new(tags, &{&1, 1})}
+    )
   end
 
   test "an integer tag value does not merge into an equal float one" do
     # 16 is the smallest N whose two tags maps share their top 7 hash bits, so
-    # hashbrown's control byte does not filter the pair and tags_match runs.
-    counter = Metrics.counter("rustler.test.numeric", tags: [:code])
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [counter])
+    # hashbrown's control byte does not tell them apart and enif_is_identical
+    # has to.
+    counter = Metrics.counter("rustler.test.counter")
 
-    Peep.Test.insert_metric(name, counter, 1, %{code: 16.0})
-    Peep.Test.insert_metric(name, counter, 1, %{code: 16})
-
-    series = Peep.get_all_metrics(name) |> Map.fetch!(counter)
-
-    assert series == %{%{code: 16.0} => 1, %{code: 16} => 1}
+    check(
+      metrics: [counter],
+      ops: [insert: {counter, 1, %{code: 16.0}}, insert: {counter, 1, %{code: 16}}],
+      exp_metrics: %{counter => %{%{code: 16.0} => 1, %{code: 16} => 1}}
+    )
   end
 
-  test "a rejected sample stores no tags" do
-    sum = Metrics.sum("rustler.test.sum")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [sum])
-    before = Peep.storage_size(name)
+  test "maps built in different orders are one series" do
+    counter = Metrics.counter("rustler.test.counter")
+    wide = Map.new(1..40, fn n -> {n, n} end)
+    reversed = Map.new(Enum.reverse(Map.to_list(wide)))
 
-    assert_raise ErlangError, fn -> Peep.Test.insert_metric(name, sum, 1.5, %{new: :tags}) end
-
-    assert Peep.storage_size(name) == before
+    check(
+      metrics: [counter],
+      ops: [insert: {counter, 1, wide}, insert: {counter, 1, reversed}],
+      exp_metrics: %{counter => %{wide => 2}}
+    )
   end
 
-  test "pruning keeps every metric's surviving series, and pruned tags can return" do
+  test "prune_tags matches an exotic tag value" do
+    counter = Metrics.counter("rustler.test.counter")
+
+    check(
+      metrics: [counter],
+      ops: [
+        insert: {counter, 1, %{tag: ["a", "b"]}},
+        insert: {counter, 1, %{tag: ["c"]}},
+        prune: [%{tag: ["a", "b"]}]
+      ],
+      exp_metrics: %{counter => %{%{tag: ["c"]} => 1}}
+    )
+  end
+
+  test "prune_tags rejects a non-map pattern" do
+    counter = Metrics.counter("rustler.test.counter")
+
+    check(metrics: [counter], ops: [prune: [:not_a_map]], exp_errors: [:bad_tags_map])
+  end
+
+  test "pruning keeps every metric's surviving series" do
     counter = Metrics.counter("rustler.test.counter")
     sum = Metrics.sum("rustler.test.sum")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [counter, sum])
 
-    for tags <- [%{route: "a"}, %{route: "b"}], metric <- [counter, sum] do
-      Peep.Test.insert_metric(name, metric, 3, tags)
+    check(
+      metrics: [counter, sum],
+      ops: [
+        insert: {counter, 1, %{route: "a"}},
+        insert: {sum, 3, %{route: "a"}},
+        insert: {counter, 1, %{route: "b"}},
+        insert: {sum, 3, %{route: "b"}},
+        prune: [%{route: "a"}]
+      ],
+      exp_metrics: %{counter => %{%{route: "b"} => 1}, sum => %{%{route: "b"} => 3}}
+    )
+  end
+
+  test "pruning every tags map leaves storage as it was at registration" do
+    counter = Metrics.counter("rustler.test.counter")
+    sum = Metrics.sum("rustler.test.sum")
+
+    check(
+      metrics: [counter, sum],
+      ops: [
+        insert: {counter, 1, %{route: "a"}},
+        insert: {sum, 3, %{route: "b"}},
+        prune: [%{route: "a"}, %{route: "b"}]
+      ]
+    )
+  end
+
+  test "a pruned tags map can be inserted again" do
+    counter = Metrics.counter("rustler.test.counter")
+
+    check(
+      metrics: [counter],
+      ops: [
+        insert: {counter, 1, %{route: "a"}},
+        prune: [%{route: "a"}],
+        insert: {counter, 1, %{route: "a"}}
+      ],
+      exp_metrics: %{counter => %{%{route: "a"} => 1}}
+    )
+  end
+
+  test "a float sum value raises bad_measurement and stores nothing" do
+    sum = Metrics.sum("rustler.test.sum")
+
+    check(
+      metrics: [sum],
+      ops: [insert: {sum, 1.5, %{new: :tags}}],
+      exp_errors: [:bad_measurement]
+    )
+  end
+
+  test "a non-numeric last_value raises bad_measurement and stores nothing" do
+    gauge = Metrics.last_value("rustler.test.gauge")
+
+    check(
+      metrics: [gauge],
+      ops: [insert: {gauge, :nope, %{new: :tags}}],
+      exp_errors: [:bad_measurement]
+    )
+  end
+
+  test "an integer last_value stays an integer" do
+    gauge = Metrics.last_value("rustler.test.gauge")
+
+    check(
+      metrics: [gauge],
+      ops: [insert: {gauge, 10, %{}}],
+      exp_metrics: %{gauge => %{%{} => 10}}
+    )
+  end
+
+  test "an integer distribution value adds to the sum exactly" do
+    dist = powers_of_ten("rustler.test.dist")
+    value = (1 <<< 53) + 1
+
+    check(
+      metrics: [dist],
+      ops: [insert: {dist, value, %{}}],
+      exp_metrics: %{dist => %{%{} => buckets(dist, %{infinity: 1}, value)}}
+    )
+  end
+
+  for value <- [1.0e19, -1.0e19, 1 <<< 64] do
+    test "a distribution value of #{value} raises bad_measurement and stores nothing" do
+      dist = powers_of_ten("rustler.test.dist")
+
+      check(
+        metrics: [dist],
+        ops: [insert: {dist, unquote(value), %{new: :tags}}],
+        exp_errors: [:bad_measurement]
+      )
     end
+  end
 
-    Peep.prune_tags(name, [%{route: "a"}])
+  test "a calculator's descending boundaries still bucket samples by bound" do
+    dist =
+      Metrics.distribution("rustler.test.dist",
+        reporter_options: [peep_bucket_calculator: __MODULE__.DescendingBuckets]
+      )
 
-    assert Peep.get_all_metrics(name) == %{
-             counter => %{%{route: "b"} => 1},
-             sum => %{%{route: "b"} => 3}
-           }
-
-    Peep.Test.insert_metric(name, counter, 1, %{route: "a"})
-
-    assert Peep.get_all_metrics(name) |> Map.fetch!(counter) == %{
-             %{route: "a"} => 1,
-             %{route: "b"} => 1
-           }
+    check(
+      metrics: [dist],
+      ops: for(value <- [5, 50, 500, 5000], do: {:insert, {dist, value, %{}}}),
+      exp_metrics: %{
+        dist => %{%{} => %{"10" => 1, "100" => 1, "1000" => 1, :infinity => 1, :sum => 5555}}
+      }
+    )
   end
 
   test "series inserted on every scheduler merge into one per tags map" do
@@ -165,9 +245,7 @@ defmodule Peep.Storage.RustNIFTest do
     1..procs
     |> Enum.map(fn _ ->
       Task.async(fn ->
-        for route <- 1..10, metric <- [counter, sum] do
-          Peep.Test.insert_metric(name, metric, 2, %{route: route})
-        end
+        for route <- 1..10, metric <- [counter, sum], do: insert(name, metric, 2, %{route: route})
       end)
     end)
     |> Task.await_many()
@@ -177,13 +255,17 @@ defmodule Peep.Storage.RustNIFTest do
     assert Peep.get_all_metrics(name) == %{counter => expected.(1), sum => expected.(2)}
   end
 
-  test "inserts, prunes and scrapes can run concurrently" do
+  # A stress test, nondeterministic by design: it runs inserts, prunes and
+  # scrapes against each other for a fixed time, with random tags, and checks
+  # that none of them fails and that pruning everything leaves nothing behind.
+  # A prune that interleaves with an insert between interning a tags map and
+  # storing its samples leaves an orphaned or duplicate series, which this
+  # catches.
+  test "stress: inserts, prunes and scrapes can run concurrently" do
     counter = Metrics.counter("rustler.test.counter")
     sum = Metrics.sum("rustler.test.sum")
     name = Peep.Test.start_peep!(storage: @storage, metrics: [counter, sum])
-    {mod, storage} = Peep.Persistent.storage(name)
-    ids = Peep.Persistent.ids_to_metrics(Peep.Persistent.fetch(name))
-    batch = [{0, elem(ids, 0), 1, 0}, {1, elem(ids, 1), 1, 0}]
+    empty = Peep.storage_size(name)
     deadline = System.monotonic_time(:millisecond) + 300
 
     until_deadline = fn fun ->
@@ -198,7 +280,7 @@ defmodule Peep.Storage.RustNIFTest do
       for _ <- 1..System.schedulers_online() do
         until_deadline.(fn ->
           tags = %{route: Enum.random(1..20)}
-          :ok = mod.insert_metrics(mod.resolve(storage), {tags}, batch)
+          for metric <- [counter, sum], do: :ok = insert(name, metric, 1, tags)
         end)
       end
 
@@ -212,76 +294,70 @@ defmodule Peep.Storage.RustNIFTest do
     Peep.prune_tags(name, for(route <- 1..20, do: %{route: route}))
 
     assert Peep.get_all_metrics(name) == %{}
-    assert %{size: 0} = Peep.storage_size(name)
+    assert Peep.storage_size(name) == empty
   end
 
-  test "a float measurement on a Sum raises bad_measurement" do
-    sum = Metrics.sum("rustler.test.sum")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [sum])
+  # Starts a Peep over `metrics`, runs `ops` in order, and checks the reasons of
+  # the errors they raised and the whole scrape. Storage holding no series must
+  # be the size it was at registration, so a rejected sample stored nothing,
+  # not even its tags.
+  #
+  # Ops are `insert: {metric, value, tags}` and `prune: patterns`.
+  defp check(opts) do
+    name = Peep.Test.start_peep!(storage: @storage, metrics: Keyword.fetch!(opts, :metrics))
+    empty = Peep.storage_size(name)
+    exp_metrics = Keyword.get(opts, :exp_metrics, %{})
 
-    error = assert_raise ErlangError, fn -> Peep.Test.insert_metric(name, sum, 1.5, %{}) end
-    assert {:peep_storage_error, :bad_measurement, _} = error.original
+    errors = for op <- Keyword.get(opts, :ops, []), reason = run(name, op), do: reason
+
+    assert errors == Keyword.get(opts, :exp_errors, [])
+    assert Peep.get_all_metrics(name) == exp_metrics
+
+    if exp_metrics == %{} do
+      assert Peep.storage_size(name) == empty
+    end
   end
 
-  # Both `Peep.EventHandler` and `Peep.Test.insert_metric/4` guard on
-  # `is_number/1`, so reaching this at all means calling the backend directly.
-  test "a non-numeric last_value measurement raises bad_measurement" do
-    gauge = Metrics.last_value("rustler.test.gauge")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [gauge])
-    {mod, storage} = Peep.Persistent.storage(name)
-
-    error =
-      assert_raise ErlangError, fn ->
-        mod.insert_metrics(mod.resolve(storage), {%{}}, [{0, gauge, :nope, 0}])
-      end
-
-    assert {:peep_storage_error, :bad_measurement, _} = error.original
-  end
-
-  test "an integer last_value stays an integer" do
-    gauge = Metrics.last_value("rustler.test.gauge")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [gauge])
-
-    Peep.Test.insert_metric(name, gauge, 10, %{})
-
-    assert Peep.get_all_metrics(name) |> Map.fetch!(gauge) == %{%{} => 10}
-  end
-
-  test "an integer distribution value adds to the sum exactly" do
-    dist = Metrics.distribution("rustler.test.dist")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [dist])
-    value = (1 <<< 53) + 1
-
-    Peep.Test.insert_metric(name, dist, value, %{})
-
-    assert %{%{} => %{sum: ^value}} = Peep.get_all_metrics(name) |> Map.fetch!(dist)
-  end
-
-  test "a distribution value outside 64 bits raises bad_measurement and stores nothing" do
-    dist = Metrics.distribution("rustler.test.dist")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [dist])
-
-    for value <- [1.0e19, -1.0e19, 1 <<< 64] do
-      error = assert_raise ErlangError, fn -> Peep.Test.insert_metric(name, dist, value, %{}) end
-      assert {:peep_storage_error, :bad_measurement, _} = error.original
+  # The reason of the storage error the op raised, or nil.
+  defp run(name, op) do
+    case op do
+      {:insert, {metric, value, tags}} -> insert(name, metric, value, tags)
+      {:prune, patterns} -> Peep.prune_tags(name, patterns)
     end
 
-    assert Peep.get_all_metrics(name) == %{}
+    nil
+  rescue
+    error in ErlangError ->
+      {:peep_storage_error, reason, _detail} = error.original
+      reason
   end
 
-  test "a calculator's descending boundaries still bucket samples by bound" do
-    dist =
-      Metrics.distribution("rustler.test.dist",
-        reporter_options: [peep_bucket_calculator: __MODULE__.DescendingBuckets]
-      )
+  # Calls the backend directly, unlike `Peep.Test.insert_metric/4`, so that a
+  # test can hand it values Peep's own guards drop.
+  defp insert(name, metric, value, tags) do
+    {mod, storage} = Peep.Persistent.storage(name)
+    ids = name |> Peep.Persistent.fetch() |> Peep.Persistent.ids_to_metrics() |> Tuple.to_list()
+    id = Enum.find_index(ids, &(&1 == metric))
 
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [dist])
+    mod.insert_metrics(mod.resolve(storage), {tags}, [{id, metric, value, 0}])
+  end
 
-    for value <- [5, 50, 500, 5000], do: Peep.Test.insert_metric(name, dist, value, %{})
+  defp powers_of_ten(name) do
+    Metrics.distribution(name,
+      reporter_options: [peep_bucket_calculator: Peep.Buckets.PowersOfTen]
+    )
+  end
 
-    assert Peep.get_all_metrics(name) |> Map.fetch!(dist) == %{
-             %{} => %{"10" => 1, "100" => 1, "1000" => 1, :infinity => 1, :sum => 5555}
-           }
+  # A scraped distribution series: every bucket of `dist`, labelled by its
+  # calculator, with `counts` replacing zeros.
+  defp buckets(dist, counts, sum) do
+    {mod, config} = Peep.Buckets.config(dist)
+
+    mod.boundaries(config)
+    |> Enum.with_index(fn _bound, idx -> {mod.upper_bound(idx, config), 0} end)
+    |> Map.new()
+    |> Map.merge(%{infinity: 0, sum: sum})
+    |> Map.merge(counts)
   end
 
   # `Macro.escape/1` cannot carry a live pid or reference into the generated test.
