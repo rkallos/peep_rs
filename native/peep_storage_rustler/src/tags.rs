@@ -136,11 +136,19 @@ impl Batch<'_, '_> {
     }
 
     /// The id of the event's tags map at `tag_idx`, interning it if it is new.
+    #[inline]
     pub fn tag_id(&mut self, tag_idx: usize) -> Result<TagId, StorageError> {
-        if let Some(Some(tag_id)) = self.tag_ids.get(tag_idx) {
-            return Ok(*tag_id);
+        match self.tag_ids.get(tag_idx) {
+            Some(Some(tag_id)) => Ok(*tag_id),
+            _ => self.resolve(tag_idx),
         }
+    }
 
+    /// Kept out of line, so a cached lookup doesn't pay for interning's
+    /// register saves.
+    #[cold]
+    #[inline(never)]
+    fn resolve(&mut self, tag_idx: usize) -> Result<TagId, StorageError> {
         let tags = self
             .tags
             .get(tag_idx)
