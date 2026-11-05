@@ -8,23 +8,27 @@
     clippy::unimplemented
 )]
 
+mod error;
+mod ffi;
+mod measurement;
+mod term_store;
+
+use error::StorageError;
+use ffi::{monotonic_time_ns, scheduler_count, terms_identical, TupleElements};
 use hashbrown::hash_map::{Entry, HashMap, RawEntryMut};
 use hashbrown::HashSet;
+use measurement::Measurement;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
-use rustler::env::OwnedEnv;
-use rustler::sys::{
-    enif_get_double, enif_is_identical, enif_make_copy, enif_monotonic_time, enif_system_info,
-    ErlNifSysInfo, ErlNifTimeUnit,
-};
 use rustler::types::map::MapIterator;
 use rustler::types::tuple::get_tuple;
 use rustler::wrapper::NIF_TERM;
-use rustler::{Atom, Encoder, Env, NifMap, Resource, ResourceArc, Term, TermType};
+use rustler::{Atom, Encoder, Env, NifMap, Resource, ResourceArc, Term};
 use std::cell::Cell;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use term_store::TermStore;
 
 mod atoms {
     rustler::atoms! {
@@ -48,16 +52,8 @@ mod atoms {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-//                                   unsafe                                  //
+//                                  shards                                   //
 ///////////////////////////////////////////////////////////////////////////////
-
-fn scheduler_count() -> usize {
-    let mut info: ErlNifSysInfo = unsafe { std::mem::zeroed() };
-    unsafe {
-        enif_system_info(&mut info, size_of::<ErlNifSysInfo>());
-    }
-    info.scheduler_threads as usize
-}
 
 /// A shard index fixed per scheduler thread, so each shard has one inserting
 /// thread. Chosen here rather than in `resolve/1`, because a process can
@@ -78,82 +74,11 @@ fn thread_shard() -> usize {
     })
 }
 
-fn monotonic_time_ns() -> i64 {
-    unsafe { enif_monotonic_time(ErlNifTimeUnit::ERL_NIF_NSEC) }
-}
-
-struct TagsEnv(OwnedEnv);
-
-// SAFETY: a tag table's `RwLock` guards its `TagsEnv`, and the bucket labels'
-// `TagsEnv` is written only during registration, before `OnceLock` publishes
-// it. `store` is the only operation that allocates and takes `&mut self`, so it
-// never runs while a stored term is being read.
-unsafe impl Sync for TagsEnv {}
-
-impl TagsEnv {
-    fn new() -> Self {
-        TagsEnv(OwnedEnv::new())
-    }
-
-    fn store(&mut self, term: NIF_TERM) -> NIF_TERM {
-        self.0
-            .run(|owned| unsafe { enif_make_copy(owned.as_c_arg(), term) })
-    }
-
-    fn copy_out<'a>(&self, env: Env<'a>, term: NIF_TERM) -> Term<'a> {
-        unsafe { Term::new(env, enif_make_copy(env.as_c_arg(), term)) }
-    }
-
-    fn copy_key(&self, env: Env, key: &TagsKey) -> TagsKey {
-        TagsKey {
-            hash: key.hash,
-            term: self.copy_out(env, key.term).as_c_arg(),
-        }
-    }
-
-    fn size_of(&self, term: NIF_TERM) -> usize {
-        self.0.run(|owned| unsafe { Term::new(owned, term) }.size())
-    }
-}
-
-fn terms_identical(a: NIF_TERM, b: NIF_TERM) -> bool {
-    a == b || unsafe { enif_is_identical(a, b) == 1 }
-}
-
-/// Wraps rather than copies: sound only for a key `TagsEnv::copy_key` produced
+/// Wraps rather than copies: sound only for a key `TagsKey::copy_into` produced
 /// for this same `env`. A key still owned by a tag table needs
-/// `TagsEnv::copy_out`.
+/// `TagsKey::copy_into`.
 fn tags_term<'a>(env: Env<'a>, key: &TagsKey) -> Term<'a> {
     unsafe { Term::new(env, key.term) }
-}
-
-// rustler's f64 decoder falls back to integer decoding.
-// We don't want this behavior in Measurement::decode().
-// 5 and 5.0 must not be stored as the same value.
-fn term_as_f64(term: Term) -> Option<f64> {
-    let mut value = 0f64;
-    let found =
-        unsafe { enif_get_double(term.get_env().as_c_arg(), term.as_c_arg(), &mut value) } == 1;
-    found.then_some(value)
-}
-
-struct TupleElements<'a> {
-    env: Env<'a>,
-    elements: &'a [NIF_TERM],
-}
-
-impl<'a> TupleElements<'a> {
-    fn new(tuple: Term<'a>) -> Option<Self> {
-        let env = tuple.get_env();
-        let elements =
-            unsafe { rustler::wrapper::tuple::get_tuple(env.as_c_arg(), tuple.as_c_arg()) }.ok()?;
-        Some(TupleElements { env, elements })
-    }
-
-    fn get(&self, index: usize) -> Option<Term<'a>> {
-        let element = *self.elements.get(index)?;
-        Some(unsafe { Term::new(self.env, element) })
-    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -178,7 +103,7 @@ struct RegisteredMetrics {
     boundaries_arena: Box<[f64]>,
     /// Parallel to `boundaries_arena`: each bucket's label, owned by `labels_env`.
     labels_arena: Box<[NIF_TERM]>,
-    labels_env: TagsEnv,
+    labels_env: TermStore,
 }
 
 enum MetricSlot {
@@ -209,7 +134,7 @@ type IdMap<V> = HashMap<TagId, V, IdHashBuilder>;
 /// it removes ids from the metrics, so an insert never stores under an id that
 /// a prune has removed.
 struct TagTable {
-    env: TagsEnv,
+    env: TermStore,
     ids: HashMap<TagsKey, TagId, TermHashBuilder>,
     tags: IdMap<TagsKey>,
     /// Ids are never reused, so an id names one tags map for the table's
@@ -229,62 +154,6 @@ type LastValueCell = Mutex<(i64, Measurement)>;
 struct DistributionCell {
     buckets: Box<[AtomicU64]>,
     sum: AtomicI64,
-}
-
-///////////////////////////////////////////////////////////////////////////////
-//                                   errors                                  //
-///////////////////////////////////////////////////////////////////////////////
-
-#[derive(Debug)]
-enum StorageError {
-    BadTagsMap,
-    BadArgument(&'static str),
-    BadMeasurement(&'static str),
-    MapBuildFailed(&'static str),
-    UnknownMetricId(usize),
-    BadTagIndex(usize),
-    AlreadyRegistered,
-    NotRegistered,
-}
-
-impl StorageError {
-    fn reason(&self) -> Atom {
-        match self {
-            StorageError::BadTagsMap => atoms::bad_tags_map(),
-            StorageError::BadArgument(_) => atoms::bad_argument(),
-            StorageError::BadMeasurement(_) => atoms::bad_measurement(),
-            StorageError::MapBuildFailed(_) => atoms::map_build_failed(),
-            StorageError::UnknownMetricId(_) => atoms::unknown_metric_id(),
-            StorageError::BadTagIndex(_) => atoms::bad_tag_index(),
-            StorageError::AlreadyRegistered => atoms::already_registered(),
-            StorageError::NotRegistered => atoms::not_registered(),
-        }
-    }
-
-    fn detail(&self) -> String {
-        match self {
-            StorageError::BadTagsMap => "tags must be a map".into(),
-            StorageError::BadArgument(detail) => (*detail).into(),
-            StorageError::BadMeasurement(detail) => (*detail).into(),
-            StorageError::MapBuildFailed(detail) => (*detail).into(),
-            StorageError::UnknownMetricId(id) => format!("no metric registered for id {id}"),
-            StorageError::BadTagIndex(idx) => format!("no tags map at index {idx}"),
-            StorageError::AlreadyRegistered => "register_metrics was already called".into(),
-            StorageError::NotRegistered => "register_metrics has not been called".into(),
-        }
-    }
-}
-
-impl Encoder for StorageError {
-    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
-        (atoms::peep_storage_error(), self.reason(), self.detail()).encode(env)
-    }
-}
-
-impl From<StorageError> for rustler::Error {
-    fn from(error: StorageError) -> Self {
-        rustler::Error::RaiseTerm(Box::new(error))
-    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -373,7 +242,7 @@ fn metric_slot_for(
 struct BucketLayouts {
     boundaries: Vec<f64>,
     labels: Vec<NIF_TERM>,
-    labels_env: TagsEnv,
+    labels_env: TermStore,
     interned: Vec<(usize, usize)>,
 }
 
@@ -382,7 +251,7 @@ impl BucketLayouts {
         BucketLayouts {
             boundaries: Vec::new(),
             labels: Vec::new(),
-            labels_env: TagsEnv::new(),
+            labels_env: TermStore::new(),
             interned: Vec::new(),
         }
     }
@@ -733,7 +602,7 @@ fn merge_shards<V, A>(
                 }
                 RawEntryMut::Vacant(entry) => {
                     let copy = copy.unwrap_or_else(|| {
-                        let copy = table.env.copy_key(env, &key);
+                        let copy = key.copy_into(env, &table.env);
                         copies.insert(*tag_id, copy);
                         copy
                     });
@@ -923,7 +792,7 @@ fn prune_shard<'a>(
 
 fn matches_any_pattern<'a>(
     env: Env<'a>,
-    tags_env: &TagsEnv,
+    tags_env: &TermStore,
     key: &TagsKey,
     patterns: &[Term<'a>],
 ) -> bool {
@@ -943,7 +812,7 @@ fn matches_any_pattern<'a>(
 impl TagTable {
     fn new() -> Self {
         TagTable {
-            env: TagsEnv::new(),
+            env: TermStore::new(),
             ids: HashMap::default(),
             tags: HashMap::default(),
             next_id: 0,
@@ -967,7 +836,7 @@ impl TagTable {
     /// survivors into a fresh one and dropping the old. Survivors keep their
     /// ids, so the metrics' entries for them stay valid.
     fn remove(&mut self, doomed: &HashSet<TagId, IdHashBuilder>) {
-        let mut env = TagsEnv::new();
+        let mut env = TermStore::new();
         let capacity = self.tags.len();
         let mut ids = HashMap::with_capacity_and_hasher(capacity, TermHashBuilder::default());
         let mut tags = HashMap::with_capacity_and_hasher(capacity, IdHashBuilder::default());
@@ -1129,6 +998,14 @@ impl TagsKey {
     fn matches(&self, tags: Term) -> bool {
         terms_identical(self.term, tags.as_c_arg())
     }
+
+    /// Copies a key owned by `store` into `env`.
+    fn copy_into(&self, env: Env, store: &TermStore) -> TagsKey {
+        TagsKey {
+            hash: self.hash,
+            term: store.copy_out(env, self.term).as_c_arg(),
+        }
+    }
 }
 
 impl PartialEq for TagsKey {
@@ -1141,68 +1018,6 @@ impl Eq for TagsKey {}
 impl Hash for TagsKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.hash);
-    }
-}
-
-/// `Peep.EventHandler` drops non-numeric measurements before any backend sees
-/// them, so these are the only two shapes that arrive.
-#[derive(Clone, Copy)]
-enum Measurement {
-    Int(i64),
-    Float(f64),
-}
-
-impl Measurement {
-    fn decode(term: Term) -> Result<Self, StorageError> {
-        match term.get_type() {
-            TermType::Integer => term
-                .decode()
-                .map(Measurement::Int)
-                .map_err(|_| StorageError::BadMeasurement("integer does not fit in 64 bits")),
-            TermType::Float => term_as_f64(term)
-                .map(Measurement::Float)
-                .ok_or(StorageError::BadMeasurement("float")),
-            _ => Err(StorageError::BadMeasurement("measurement must be a number")),
-        }
-    }
-
-    /// Bucket bounds are floats, so an integer above 2^53 is bucketed as the
-    /// nearest float.
-    fn as_f64(self) -> f64 {
-        match self {
-            Measurement::Int(int) => int as f64,
-            Measurement::Float(float) => float,
-        }
-    }
-
-    /// The contribution to a distribution's sum. A float is rounded as
-    /// `round/1` does, and one that does not fit in an i64 is rejected rather
-    /// than saturated by `as`.
-    fn rounded(self) -> Result<i64, StorageError> {
-        const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
-
-        match self {
-            Measurement::Int(int) => Ok(int),
-            Measurement::Float(float) => {
-                let rounded = float.round();
-                if (-TWO_POW_63..TWO_POW_63).contains(&rounded) {
-                    Ok(rounded as i64)
-                } else {
-                    Err(StorageError::BadMeasurement(
-                        "distribution value does not fit in 64 bits",
-                    ))
-                }
-            }
-        }
-    }
-}
-
-impl Encoder for Measurement {
-    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
-        match self {
-            Measurement::Int(i) => i.encode(env),
-            Measurement::Float(f) => f.encode(env),
-        }
     }
 }
 
