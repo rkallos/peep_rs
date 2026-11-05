@@ -15,6 +15,12 @@ Mix.install([{:peep_rs, path: Path.expand("..", __DIR__)}, {:benchee, "~> 1.5"}]
 
 alias Telemetry.Metrics
 
+# Closures in a script are evaluated by `erl_eval`, so the timed call lives in
+# a compiled module.
+defmodule Scrape do
+  def run(storage, persistent), do: Peep.Storage.RustNIF.get_all_metrics(storage, persistent)
+end
+
 {opts, _, _} =
   OptionParser.parse(System.argv(),
     strict: [series: :integer, save: :string, tag: :string, load: :string]
@@ -35,11 +41,11 @@ metrics = [
 
 name = :scrape_bench
 {:ok, _} = Peep.start_link(name: name, storage: {Peep.Storage.RustNIF, []}, metrics: metrics)
-{mod, storage} = Peep.Persistent.storage(name)
+persistent = Peep.Persistent.fetch(name)
+{Peep.Storage.RustNIF = mod, storage} = Peep.Persistent.storage(name)
 
 batch =
-  name
-  |> Peep.Persistent.fetch()
+  persistent
   |> Peep.Persistent.ids_to_metrics()
   |> Tuple.to_list()
   |> Enum.with_index(fn metric, id -> {id, metric, 27, 0} end)
@@ -67,6 +73,6 @@ comparison =
   end)
 
 Benchee.run(
-  %{"get_all_metrics/1" => fn -> Peep.get_all_metrics(name) end},
+  %{"get_all_metrics/2" => fn -> Scrape.run(storage, persistent) end},
   [warmup: 2, time: 10] ++ comparison
 )
