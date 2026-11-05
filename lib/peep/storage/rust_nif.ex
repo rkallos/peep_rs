@@ -63,8 +63,7 @@ defmodule Peep.Storage.RustNIF do
   @impl true
   def prune_tags(_, _), do: :erlang.nif_error(:nif_not_loaded)
 
-  # No erl_nif equivalent of `:erlang.system_info(:scheduler_id)` exists;
-  # `enif_thread_type/0` says what kind of scheduler this is, not which one.
+  # `insert_metrics/3` picks its shard from the calling scheduler thread.
   @impl true
-  def resolve(storage), do: {storage, :erlang.system_info(:scheduler_id) - 1}
+  def resolve(storage), do: storage
 end

@@ -14,9 +14,10 @@ use rustler::types::map::MapIterator;
 use rustler::types::tuple::get_tuple;
 use rustler::wrapper::NIF_TERM;
 use rustler::{Atom, Encoder, Env, NifMap, Resource, ResourceArc, Term, TermType};
+use std::cell::Cell;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::mem::size_of;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 mod atoms {
@@ -51,6 +52,25 @@ fn scheduler_count() -> usize {
         enif_system_info(&mut info, size_of::<ErlNifSysInfo>());
     }
     info.scheduler_threads as usize
+}
+
+/// A shard index fixed per scheduler thread, so each shard has one inserting
+/// thread. Chosen here rather than in `resolve/1`, because a process can
+/// migrate to another scheduler between the two calls.
+fn thread_shard() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static SHARD: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    SHARD.with(|shard| {
+        shard.get().unwrap_or_else(|| {
+            let assigned = NEXT.fetch_add(1, Ordering::Relaxed);
+            shard.set(Some(assigned));
+            assigned
+        })
+    })
 }
 
 fn monotonic_time_ns() -> i64 {
@@ -349,11 +369,11 @@ fn intern_boundaries(
 /// dispatch on it.
 #[rustler::nif]
 fn insert_metrics(
-    resolved: (&Storage, usize),
+    storage: &Storage,
     tag_results: Term,
     batch: Term,
 ) -> Result<Atom, rustler::Error> {
-    let (storage, shard_id) = resolved;
+    let shard_id = thread_shard();
     let registered = storage.registered.get().ok_or(StorageError::NotRegistered)?;
 
     let tag_terms = TupleElements::new(tag_results)
@@ -814,10 +834,8 @@ impl<V> Shards<V> {
         self.shards.len()
     }
 
-    // `resolve/1` hands back `scheduler_id - 1`, and there is one shard per
-    // scheduler.
     fn shard(&self, shard_id: usize) -> &RwLock<Shard<V>> {
-        &self.shards[shard_id].0
+        &self.shards[shard_id % self.shards.len()].0
     }
 
     /// Exactly one of `make` and `apply` runs.
