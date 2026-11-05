@@ -26,7 +26,7 @@ mod atoms {
         metric_sum = "Elixir.Telemetry.Metrics.Sum",
         metric_last_value = "Elixir.Telemetry.Metrics.LastValue",
         metric_distribution = "Elixir.Telemetry.Metrics.Distribution",
-        peep_bucket_boundaries,
+        peep_buckets,
         infinity,
         sum,
         peep_storage_error,
@@ -37,7 +37,6 @@ mod atoms {
         unknown_metric_id,
         bad_tag_index,
         bad_measurement,
-        unsorted_boundaries,
         map_build_failed,
     }
 }
@@ -79,9 +78,10 @@ fn monotonic_time_ns() -> i64 {
 
 struct TagsEnv(OwnedEnv);
 
-// SAFETY: the shard's `RwLock` guards this. `store` is the only operation that
-// allocates and takes `&mut self`, so it is reachable only through the write
-// guard; no stored term is ever read outside a guard.
+// SAFETY: a shard's `RwLock` guards its `TagsEnv`, and the bucket labels'
+// `TagsEnv` is written only during registration, before `OnceLock` publishes
+// it. `store` is the only operation that allocates and takes `&mut self`, so it
+// never runs while a stored term is being read.
 unsafe impl Sync for TagsEnv {}
 
 impl TagsEnv {
@@ -166,6 +166,9 @@ impl std::panic::RefUnwindSafe for Storage {}
 struct RegisteredMetrics {
     metrics: Vec<MetricSlot>,
     boundaries_arena: Box<[f64]>,
+    /// Parallel to `boundaries_arena`: each bucket's label, owned by `labels_env`.
+    labels_arena: Box<[NIF_TERM]>,
+    labels_env: TagsEnv,
 }
 
 enum MetricSlot {
@@ -173,6 +176,7 @@ enum MetricSlot {
     Sum(Shards<AtomicI64>),
     LastValue(Shards<LastValueCell>),
     Distribution {
+        /// Offset and length into `boundaries_arena` and `labels_arena`.
         boundaries: (usize, usize),
         shards: Shards<DistributionCell>,
     },
@@ -215,7 +219,6 @@ enum StorageError {
     MapBuildFailed(&'static str),
     UnknownMetricId(usize),
     BadTagIndex(usize),
-    UnsortedBoundaries,
     AlreadyRegistered,
     NotRegistered,
 }
@@ -229,7 +232,6 @@ impl StorageError {
             StorageError::MapBuildFailed(_) => atoms::map_build_failed(),
             StorageError::UnknownMetricId(_) => atoms::unknown_metric_id(),
             StorageError::BadTagIndex(_) => atoms::bad_tag_index(),
-            StorageError::UnsortedBoundaries => atoms::unsorted_boundaries(),
             StorageError::AlreadyRegistered => atoms::already_registered(),
             StorageError::NotRegistered => atoms::not_registered(),
         }
@@ -243,9 +245,6 @@ impl StorageError {
             StorageError::MapBuildFailed(detail) => (*detail).into(),
             StorageError::UnknownMetricId(id) => format!("no metric registered for id {id}"),
             StorageError::BadTagIndex(idx) => format!("no tags map at index {idx}"),
-            StorageError::UnsortedBoundaries => {
-                "Peep.Buckets.boundaries/1 must return ascending values".into()
-            }
             StorageError::AlreadyRegistered => "register_metrics was already called".into(),
             StorageError::NotRegistered => "register_metrics has not been called".into(),
         }
@@ -279,21 +278,23 @@ fn new(_opts: Term) -> ResourceArc<Storage> {
 //                              register_metrics                             //
 ///////////////////////////////////////////////////////////////////////////////
 
-#[rustler::nif]
+// Copies bucket labels into an environment of their own.
+#[rustler::nif(schedule = "DirtyCpu")]
 fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rustler::Error> {
     let n_shards = scheduler_count();
-    let mut boundaries_arena: Vec<f64> = Vec::new();
-    let mut interned: Vec<(Vec<f64>, usize)> = Vec::new();
+    let mut layouts = BucketLayouts::new();
 
     let metrics = get_tuple(ids_to_metrics)
         .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?
         .into_iter()
-        .map(|metric| metric_slot_for(metric, &mut boundaries_arena, &mut interned, n_shards))
+        .map(|metric| metric_slot_for(metric, &mut layouts, n_shards))
         .collect::<Result<_, _>>()?;
 
     let registered = RegisteredMetrics {
         metrics,
-        boundaries_arena: boundaries_arena.into_boxed_slice(),
+        boundaries_arena: layouts.boundaries.into_boxed_slice(),
+        labels_arena: layouts.labels.into_boxed_slice(),
+        labels_env: layouts.labels_env,
     };
 
     storage
@@ -306,8 +307,7 @@ fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rus
 
 fn metric_slot_for(
     metric: Term,
-    arena: &mut Vec<f64>,
-    interned: &mut Vec<(Vec<f64>, usize)>,
+    layouts: &mut BucketLayouts,
     n_shards: usize,
 ) -> Result<MetricSlot, StorageError> {
     let struct_name: Atom = metric
@@ -323,18 +323,17 @@ fn metric_slot_for(
     } else if struct_name == atoms::metric_last_value() {
         Ok(MetricSlot::LastValue(Shards::new(n_shards)))
     } else if struct_name == atoms::metric_distribution() {
-        let boundaries: Vec<f64> = metric
-            .map_get(atoms::peep_bucket_boundaries())
-            .map_err(|_| {
-                StorageError::BadArgument("Distribution metric must carry :peep_bucket_boundaries")
-            })?
+        // Peep sorts these by bound, with no repeated bound or label.
+        let buckets: Vec<(f64, Term)> = metric
+            .map_get(atoms::peep_buckets())
+            .map_err(|_| StorageError::BadArgument("Distribution metric must carry :peep_buckets"))?
             .decode()
             .map_err(|_| {
-                StorageError::BadArgument(":peep_bucket_boundaries must be a list of numbers")
+                StorageError::BadArgument(":peep_buckets must be a list of {bound, label} tuples")
             })?;
 
         Ok(MetricSlot::Distribution {
-            boundaries: intern_boundaries(arena, interned, boundaries)?,
+            boundaries: layouts.intern(&buckets),
             shards: Shards::new(n_shards),
         })
     } else {
@@ -342,24 +341,46 @@ fn metric_slot_for(
     }
 }
 
-fn intern_boundaries(
-    arena: &mut Vec<f64>,
-    interned: &mut Vec<(Vec<f64>, usize)>,
+/// Distributions usually share a bucket layout, so each distinct layout is
+/// stored once.
+struct BucketLayouts {
     boundaries: Vec<f64>,
-) -> Result<(usize, usize), StorageError> {
-    if !boundaries.is_sorted() {
-        return Err(StorageError::UnsortedBoundaries);
+    labels: Vec<NIF_TERM>,
+    labels_env: TagsEnv,
+    interned: Vec<(usize, usize)>,
+}
+
+impl BucketLayouts {
+    fn new() -> Self {
+        BucketLayouts {
+            boundaries: Vec::new(),
+            labels: Vec::new(),
+            labels_env: TagsEnv::new(),
+            interned: Vec::new(),
+        }
     }
 
-    if let Some((existing, offset)) = interned.iter().find(|(existing, _)| existing == &boundaries) {
-        return Ok((*offset, existing.len()));
-    }
+    fn intern(&mut self, buckets: &[(f64, Term)]) -> (usize, usize) {
+        let matches = |&(offset, len): &(usize, usize)| {
+            len == buckets.len()
+                && buckets.iter().enumerate().all(|(idx, (bound, label))| {
+                    self.boundaries[offset + idx] == *bound
+                        && terms_identical(self.labels[offset + idx], label.as_c_arg())
+                })
+        };
 
-    let offset = arena.len();
-    arena.extend_from_slice(&boundaries);
-    let len = boundaries.len();
-    interned.push((boundaries, offset));
-    Ok((offset, len))
+        if let Some(layout) = self.interned.iter().find(|layout| matches(layout)) {
+            return *layout;
+        }
+
+        let layout = (self.boundaries.len(), buckets.len());
+        for (bound, label) in buckets {
+            self.boundaries.push(*bound);
+            self.labels.push(self.labels_env.store(label.as_c_arg()));
+        }
+        self.interned.push(layout);
+        layout
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -489,8 +510,13 @@ fn storage_size(storage: &Storage) -> StorageSize {
     };
 
     let mut size = 0;
-    let mut memory =
-        size_of::<RegisteredMetrics>() + registered.boundaries_arena.len() * size_of::<f64>();
+    let mut memory = size_of::<RegisteredMetrics>()
+        + registered.boundaries_arena.len() * size_of::<f64>()
+        + registered.labels_arena.len() * size_of::<NIF_TERM>();
+
+    for label in registered.labels_arena.iter() {
+        memory += registered.labels_env.size_of(*label);
+    }
 
     for slot in &registered.metrics {
         let (slot_size, slot_memory) = match slot {
@@ -562,7 +588,9 @@ fn nif_get_all_metrics<'a>(
                 encode_counter_map(env, shards)?
             }
             MetricSlot::LastValue(shards) => encode_last_value_map(env, shards)?,
-            MetricSlot::Distribution { shards, .. } => encode_distribution_map(env, shards)?,
+            MetricSlot::Distribution { boundaries, shards } => {
+                encode_distribution_map(env, registered, *boundaries, shards)?
+            }
         };
 
         if len > 0 {
@@ -611,7 +639,7 @@ fn encode_merged<'a, A>(
     env: Env<'a>,
     combined: &HashMap<TagsKey, A, TermHashBuilder>,
     label: &'static str,
-    encode: impl Fn(Env<'a>, &A) -> Result<Term<'a>, StorageError>,
+    mut encode: impl FnMut(Env<'a>, &A) -> Result<Term<'a>, StorageError>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let mut keys = Vec::with_capacity(combined.len());
     let mut vals = Vec::with_capacity(combined.len());
@@ -666,6 +694,8 @@ fn encode_last_value_map<'a>(
 
 fn encode_distribution_map<'a>(
     env: Env<'a>,
+    registered: &RegisteredMetrics,
+    (offset, len): (usize, usize),
     distributions: &Shards<DistributionCell>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let combined = merge_shards(
@@ -684,35 +714,29 @@ fn encode_distribution_map<'a>(
         },
     );
 
-    encode_merged(env, &combined, "distribution map", |env, (buckets, sum)| {
-        encode_distribution_buckets(env, buckets, *sum)
-    })
-}
-
-fn encode_distribution_buckets<'a>(
-    env: Env<'a>,
-    buckets: &[u64],
-    sum: i64,
-) -> Result<Term<'a>, StorageError> {
-    let overflow_idx = buckets.len().saturating_sub(1);
-    let mut keys = Vec::with_capacity(buckets.len() + 1);
-    let mut vals = Vec::with_capacity(buckets.len() + 1);
-
-    for (idx, count) in buckets.iter().enumerate() {
-        let key = if idx == overflow_idx {
-            atoms::infinity().encode(env)
-        } else {
-            (idx as u64).encode(env)
-        };
-        keys.push(key);
-        vals.push(count.encode(env));
+    if combined.is_empty() {
+        return Ok((0, Term::map_new(env)));
     }
 
+    // One key per bucket, in bucket order, then `:sum`. Every series of this
+    // metric shares these keys.
+    let mut keys: Vec<Term> = registered.labels_arena[offset..offset + len]
+        .iter()
+        .map(|label| registered.labels_env.copy_out(env, *label))
+        .collect();
+    keys.push(atoms::infinity().encode(env));
     keys.push(atoms::sum().encode(env));
-    vals.push(sum.encode(env));
 
-    Term::map_from_term_arrays(env, &keys, &vals)
-        .map_err(|_| StorageError::MapBuildFailed("distribution bucket map"))
+    let mut vals = Vec::with_capacity(keys.len());
+
+    encode_merged(env, &combined, "distribution map", |env, (buckets, sum)| {
+        vals.clear();
+        vals.extend(buckets.iter().map(|count| count.encode(env)));
+        vals.push(sum.encode(env));
+
+        Term::map_from_term_arrays(env, &keys, &vals)
+            .map_err(|_| StorageError::MapBuildFailed("distribution bucket map"))
+    })
 }
 
 ///////////////////////////////////////////////////////////////////////////////

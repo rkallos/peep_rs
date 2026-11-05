@@ -11,7 +11,7 @@ defmodule Peep.Storage.RustNIFTest.DescendingBuckets do
   def bucket_for(_, _), do: 0
 
   @impl true
-  def upper_bound(_, _), do: "1000"
+  def upper_bound(idx, _), do: Enum.at(["1000", "100", "10"], idx, "+Inf")
 
   @impl true
   def number_of_buckets(_), do: 3
@@ -154,20 +154,19 @@ defmodule Peep.Storage.RustNIFTest do
     assert Peep.get_all_metrics(name) |> Map.fetch!(gauge) == %{%{} => 10}
   end
 
-  test "descending bucket boundaries are rejected at registration" do
-    Process.flag(:trap_exit, true)
-
+  test "a calculator's descending boundaries still bucket samples by bound" do
     dist =
       Metrics.distribution("rustler.test.dist",
         reporter_options: [peep_bucket_calculator: __MODULE__.DescendingBuckets]
       )
 
-    name = :"rustler_test_#{System.unique_integer([:positive])}"
+    name = Peep.Test.start_peep!(storage: @storage, metrics: [dist])
 
-    assert {:error, {reason, _stacktrace}} =
-             Peep.start_link(name: name, storage: @storage, metrics: [dist])
+    for value <- [5, 50, 500, 5000], do: Peep.Test.insert_metric(name, dist, value, %{})
 
-    assert {:peep_storage_error, :unsorted_boundaries, _} = reason
+    assert Peep.get_all_metrics(name) |> Map.fetch!(dist) == %{
+             %{} => %{"10" => 1, "100" => 1, "1000" => 1, :infinity => 1, :sum => 5555}
+           }
   end
 
   # `Macro.escape/1` cannot carry a live pid or reference into the generated test.
