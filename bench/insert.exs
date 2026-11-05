@@ -23,6 +23,17 @@ Mix.install([{:peep_rs, path: Path.expand("..", __DIR__)}, {:benchee, "~> 1.5"}]
 
 alias Telemetry.Metrics
 
+# Closures in a script are evaluated by `erl_eval`, so the hot loop lives in a
+# compiled module, calling the backend directly.
+defmodule Insert do
+  def run([], _storage), do: :ok
+
+  def run([{tags, batch} | events], storage) do
+    Peep.Storage.RustNIF.insert_metrics(storage, tags, batch)
+    run(events, storage)
+  end
+end
+
 {opts, _, _} =
   OptionParser.parse(System.argv(),
     strict: [
@@ -62,7 +73,7 @@ name = :insert_bench
     metrics: mixed_metrics ++ wide_metrics
   )
 
-{mod, storage} = Peep.Persistent.storage(name)
+{Peep.Storage.RustNIF, storage} = Peep.Persistent.storage(name)
 
 {mixed, wide} =
   name
@@ -99,11 +110,7 @@ comparison =
 
 Benchee.run(
   %{
-    "1,000 events" => fn events ->
-      Enum.each(events, fn {tags, batch} ->
-        mod.insert_metrics(mod.resolve(storage), tags, batch)
-      end)
-    end
+    "1,000 events" => &Insert.run(&1, storage)
   },
   [
     inputs: %{"mixed" => mixed_events, "wide" => wide_events},
