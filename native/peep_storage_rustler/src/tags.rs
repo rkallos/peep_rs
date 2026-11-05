@@ -212,6 +212,14 @@ impl Doomed {
     pub fn contains(&self, tag_id: &TagId) -> bool {
         self.ids.contains(tag_id)
     }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &TagId> {
+        self.ids.iter()
+    }
 }
 
 /// A tags map's hash and term. The term is either stored in a tag table, and

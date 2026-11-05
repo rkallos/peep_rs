@@ -358,11 +358,17 @@ fn add(shard: &RwLock<IdMap<AtomicI64>>, tag_id: TagId, delta: i64) {
     });
 }
 
+/// Walks whichever of `doomed` and the shard's series is smaller.
 fn remove<V>(shards: &Shards<V>, doomed: &Doomed) {
-    shards
-        .get(doomed.shard())
-        .write()
-        .retain(|tag_id, _| !doomed.contains(tag_id));
+    let mut map = shards.get(doomed.shard()).write();
+
+    if doomed.len() < map.len() {
+        for tag_id in doomed.iter() {
+            map.remove(tag_id);
+        }
+    } else {
+        map.retain(|tag_id, _| !doomed.contains(tag_id));
+    }
 }
 
 fn size_of_shards<V: SeriesValue>(shards: &Shards<V>) -> (usize, usize) {
