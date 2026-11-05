@@ -13,8 +13,8 @@ use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use rustler::env::OwnedEnv;
 use rustler::sys::{
-    enif_get_double, enif_is_identical, enif_make_copy, enif_monotonic_time,
-    enif_system_info, ErlNifSysInfo, ErlNifTimeUnit,
+    enif_get_double, enif_is_identical, enif_make_copy, enif_monotonic_time, enif_system_info,
+    ErlNifSysInfo, ErlNifTimeUnit,
 };
 use rustler::types::map::MapIterator;
 use rustler::types::tuple::get_tuple;
@@ -96,7 +96,8 @@ impl TagsEnv {
     }
 
     fn store(&mut self, term: NIF_TERM) -> NIF_TERM {
-        self.0.run(|owned| unsafe { enif_make_copy(owned.as_c_arg(), term) })
+        self.0
+            .run(|owned| unsafe { enif_make_copy(owned.as_c_arg(), term) })
     }
 
     fn copy_out<'a>(&self, env: Env<'a>, term: NIF_TERM) -> Term<'a> {
@@ -420,7 +421,10 @@ fn insert_metrics(
     tag_results: Term,
     batch: Term,
 ) -> Result<Atom, rustler::Error> {
-    let registered = storage.registered.get().ok_or(StorageError::NotRegistered)?;
+    let registered = storage
+        .registered
+        .get()
+        .ok_or(StorageError::NotRegistered)?;
     let shard_id = thread_shard() % registered.tag_tables.len();
 
     let tag_terms = TupleElements::new(tag_results)
@@ -468,7 +472,11 @@ fn insert_metrics(
 fn intern(table: &mut RwLockUpgradableReadGuard<TagTable>, tags: Term) -> TagId {
     let hash = tags.hash_internal(0);
 
-    if let Some((_, tag_id)) = table.ids.raw_entry().from_hash(hash, |key| key.matches(tags)) {
+    if let Some((_, tag_id)) = table
+        .ids
+        .raw_entry()
+        .from_hash(hash, |key| key.matches(tags))
+    {
         return *tag_id;
     }
 
@@ -630,8 +638,11 @@ fn nif_get_all_metrics<'a>(
     let metric_terms = get_tuple(ids_to_metrics)
         .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?;
 
-    let mut copies: Vec<TagCopies> =
-        registered.tag_tables.iter().map(|_| TagCopies::default()).collect();
+    let mut copies: Vec<TagCopies> = registered
+        .tag_tables
+        .iter()
+        .map(|_| TagCopies::default())
+        .collect();
 
     let mut outer_keys = Vec::new();
     let mut outer_vals = Vec::new();
@@ -662,7 +673,11 @@ fn nif_get_all_metrics<'a>(
 }
 
 fn combined_capacity<V>(shards: &Shards<V>) -> usize {
-    shards.iter().map(|shard| shard.read().len()).max().unwrap_or(0)
+    shards
+        .iter()
+        .map(|shard| shard.read().len())
+        .max()
+        .unwrap_or(0)
 }
 
 /// For one shard, the caller-environment copy of each tags map a scrape has
@@ -706,7 +721,10 @@ fn merge_shards<V, A>(
                 },
             };
 
-            match combined.raw_entry_mut().from_hash(key.hash, |seen: &TagsKey| *seen == key) {
+            match combined
+                .raw_entry_mut()
+                .from_hash(key.hash, |seen: &TagsKey| *seen == key)
+            {
                 RawEntryMut::Occupied(mut entry) => {
                     if copy.map(|copy| copy.term) != Some(entry.key().term) {
                         copies.insert(*tag_id, *entry.key());
@@ -806,8 +824,11 @@ fn encode_distribution_map<'a>(
         copies,
         distributions,
         |cell: &DistributionCell| {
-            let buckets: Vec<u64> =
-                cell.buckets.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+            let buckets: Vec<u64> = cell
+                .buckets
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect();
             (buckets, cell.sum.load(Ordering::Relaxed))
         },
         |(buckets, sum), cell| {
@@ -1016,7 +1037,9 @@ impl<V> Shards<V> {
     }
 
     fn remove(&self, shard_id: usize, doomed: &HashSet<TagId, IdHashBuilder>) {
-        self.shard(shard_id).write().retain(|tag_id, _| !doomed.contains(tag_id));
+        self.shard(shard_id)
+            .write()
+            .retain(|tag_id, _| !doomed.contains(tag_id));
     }
 }
 
@@ -1165,7 +1188,9 @@ impl Measurement {
                 if (-TWO_POW_63..TWO_POW_63).contains(&rounded) {
                     Ok(rounded as i64)
                 } else {
-                    Err(StorageError::BadMeasurement("distribution value does not fit in 64 bits"))
+                    Err(StorageError::BadMeasurement(
+                        "distribution value does not fit in 64 bits",
+                    ))
                 }
             }
         }
@@ -1180,7 +1205,5 @@ impl Encoder for Measurement {
         }
     }
 }
-
-
 
 rustler::init!("Elixir.Peep.Storage.RustNIF");
