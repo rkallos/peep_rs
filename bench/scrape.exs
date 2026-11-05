@@ -6,10 +6,12 @@
 # exponential buckets up to 1000 (38 keys). Erlang builds maps of up to 32 keys
 # differently from larger ones.
 #
-#     mix run bench/scrape.exs [--series N]
+#     elixir bench/scrape.exs [--series N]
 #
 # To compare revisions, run each with `--save PATH --tag NAME`, then run the
 # last one with `--load PATH` as well.
+
+Mix.install([{:peep_rs, path: Path.expand("..", __DIR__)}, {:benchee, "~> 1.5"}])
 
 alias Telemetry.Metrics
 

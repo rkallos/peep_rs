@@ -7,10 +7,12 @@
 # storage; Benchee's figures are then per process. With `--scrape`, another
 # process scrapes throughout, so inserts also contend with scrapes.
 #
-#     mix run bench/insert.exs [--series N] [--parallel N] [--scrape]
+#     elixir bench/insert.exs [--series N] [--parallel N] [--scrape]
 #
 # To compare revisions, run each with `--save PATH --tag NAME`, then run the
 # last one with `--load PATH` as well.
+
+Mix.install([{:peep_rs, path: Path.expand("..", __DIR__)}, {:benchee, "~> 1.5"}])
 
 alias Telemetry.Metrics
 

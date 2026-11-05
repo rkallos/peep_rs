@@ -20,7 +20,6 @@ defmodule Peep.Storage.RustNIF.MixProject do
   defp deps do
     [
       {:peep, path: "../../elixir/peep-rust"},
-      {:benchee, "~> 1.5", only: [:dev], runtime: false},
       # Match Cargo.toml's hash fix and override Peep's Hex dependency.
       {:rustler,
        git: "https://github.com/rusterlium/rustler.git",
