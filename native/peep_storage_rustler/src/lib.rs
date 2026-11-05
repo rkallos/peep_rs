@@ -116,7 +116,7 @@ impl TagsEnv {
 }
 
 fn terms_identical(a: NIF_TERM, b: NIF_TERM) -> bool {
-    unsafe { enif_is_identical(a, b) == 1 }
+    a == b || unsafe { enif_is_identical(a, b) == 1 }
 }
 
 /// Wraps rather than copies: sound only for a key `TagsEnv::copy_key` produced
@@ -630,17 +630,22 @@ fn nif_get_all_metrics<'a>(
     let metric_terms = get_tuple(ids_to_metrics)
         .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?;
 
+    let mut copies: Vec<TagCopies> =
+        registered.tag_tables.iter().map(|_| TagCopies::default()).collect();
+
     let mut outer_keys = Vec::new();
     let mut outer_vals = Vec::new();
 
     for (metric_term, slot) in metric_terms.iter().zip(&registered.metrics) {
         let (len, inner) = match slot {
             MetricSlot::Counter(shards) | MetricSlot::Sum(shards) => {
-                encode_counter_map(env, registered, shards)?
+                encode_counter_map(env, registered, &mut copies, shards)?
             }
-            MetricSlot::LastValue(shards) => encode_last_value_map(env, registered, shards)?,
+            MetricSlot::LastValue(shards) => {
+                encode_last_value_map(env, registered, &mut copies, shards)?
+            }
             MetricSlot::Distribution { boundaries, shards } => {
-                encode_distribution_map(env, registered, *boundaries, shards)?
+                encode_distribution_map(env, registered, &mut copies, *boundaries, shards)?
             }
         };
 
@@ -660,11 +665,22 @@ fn combined_capacity<V>(shards: &Shards<V>) -> usize {
     shards.iter().map(|shard| shard.read().len()).max().unwrap_or(0)
 }
 
+/// For one shard, the caller-environment copy of each tags map a scrape has
+/// met so far, shared by every metric the scrape encodes. Ids are never
+/// reused, so a copy stays correct even if a prune runs between two metrics.
+type TagCopies = IdMap<TagsKey>;
+
 /// The tag table's read lock is held for each shard's whole pass, which is
 /// what makes `copy_key` sound: a key never leaves its table uncopied.
+///
+/// A tags map present on several shards is copied once per shard, and all
+/// but the first copy are then replaced by the first. That one copy keys the
+/// tags map in every metric's output, and finding it in `combined` takes a
+/// pointer comparison rather than `enif_is_identical`.
 fn merge_shards<V, A>(
     env: Env,
     registered: &RegisteredMetrics,
+    copies: &mut [TagCopies],
     shards: &Shards<V>,
     init: impl Fn(&V) -> A,
     merge: impl Fn(&mut A, &V),
@@ -672,21 +688,38 @@ fn merge_shards<V, A>(
     let mut combined =
         HashMap::with_capacity_and_hasher(combined_capacity(shards), TermHashBuilder::default());
 
-    for (table, shard) in registered.tag_tables.iter().zip(shards.iter()) {
+    let tables = registered.tag_tables.iter();
+
+    for ((table, shard), copies) in tables.zip(shards.iter()).zip(copies.iter_mut()) {
         let table = table.0.read();
         let map = shard.read();
 
         for (tag_id, cell) in map.iter() {
-            // Pruning removes an id from the metrics and the table together,
-            // under the table's write lock, so this never skips.
-            let Some(key) = table.tags.get(tag_id) else {
-                continue;
+            let copy = copies.get(tag_id).copied();
+            let key = match copy {
+                Some(copy) => copy,
+                // Pruning removes an id from the metrics and the table
+                // together, under the table's write lock, so this never skips.
+                None => match table.tags.get(tag_id) {
+                    Some(key) => *key,
+                    None => continue,
+                },
             };
 
-            match combined.raw_entry_mut().from_hash(key.hash, |seen| seen == key) {
-                RawEntryMut::Occupied(mut entry) => merge(entry.get_mut(), cell),
+            match combined.raw_entry_mut().from_hash(key.hash, |seen: &TagsKey| *seen == key) {
+                RawEntryMut::Occupied(mut entry) => {
+                    if copy.map(|copy| copy.term) != Some(entry.key().term) {
+                        copies.insert(*tag_id, *entry.key());
+                    }
+                    merge(entry.get_mut(), cell);
+                }
                 RawEntryMut::Vacant(entry) => {
-                    entry.insert(table.env.copy_key(env, key), init(cell));
+                    let copy = copy.unwrap_or_else(|| {
+                        let copy = table.env.copy_key(env, &key);
+                        copies.insert(*tag_id, copy);
+                        copy
+                    });
+                    entry.insert(copy, init(cell));
                 }
             }
         }
@@ -718,11 +751,13 @@ fn encode_merged<'a, A>(
 fn encode_counter_map<'a>(
     env: Env<'a>,
     registered: &RegisteredMetrics,
+    copies: &mut [TagCopies],
     counters: &Shards<AtomicI64>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let combined = merge_shards(
         env,
         registered,
+        copies,
         counters,
         |cell: &AtomicI64| cell.load(Ordering::Relaxed),
         |total, cell| *total = total.wrapping_add(cell.load(Ordering::Relaxed)),
@@ -736,11 +771,13 @@ fn encode_counter_map<'a>(
 fn encode_last_value_map<'a>(
     env: Env<'a>,
     registered: &RegisteredMetrics,
+    copies: &mut [TagCopies],
     last_values: &Shards<LastValueCell>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let combined = merge_shards(
         env,
         registered,
+        copies,
         last_values,
         |cell: &LastValueCell| *cell.lock(),
         |newest, cell| {
@@ -759,12 +796,14 @@ fn encode_last_value_map<'a>(
 fn encode_distribution_map<'a>(
     env: Env<'a>,
     registered: &RegisteredMetrics,
+    copies: &mut [TagCopies],
     (offset, len): (usize, usize),
     distributions: &Shards<DistributionCell>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let combined = merge_shards(
         env,
         registered,
+        copies,
         distributions,
         |cell: &DistributionCell| {
             let buckets: Vec<u64> =

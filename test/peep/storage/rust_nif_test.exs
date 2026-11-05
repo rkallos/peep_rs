@@ -156,6 +156,27 @@ defmodule Peep.Storage.RustNIFTest do
            }
   end
 
+  test "series inserted on every scheduler merge into one per tags map" do
+    counter = Metrics.counter("rustler.test.counter")
+    sum = Metrics.sum("rustler.test.sum")
+    name = Peep.Test.start_peep!(storage: @storage, metrics: [counter, sum])
+    procs = System.schedulers_online() * 4
+
+    1..procs
+    |> Enum.map(fn _ ->
+      Task.async(fn ->
+        for route <- 1..10, metric <- [counter, sum] do
+          Peep.Test.insert_metric(name, metric, 2, %{route: route})
+        end
+      end)
+    end)
+    |> Task.await_many()
+
+    expected = fn per_insert -> Map.new(1..10, &{%{route: &1}, procs * per_insert}) end
+
+    assert Peep.get_all_metrics(name) == %{counter => expected.(1), sum => expected.(2)}
+  end
+
   test "inserts, prunes and scrapes can run concurrently" do
     counter = Metrics.counter("rustler.test.counter")
     sum = Metrics.sum("rustler.test.sum")
