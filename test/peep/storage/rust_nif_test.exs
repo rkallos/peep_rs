@@ -11,10 +11,29 @@ defmodule Peep.Storage.RustNIFTest.DescendingBuckets do
   def bucket_for(_, _), do: 0
 
   @impl true
-  def upper_bound(idx, _), do: Enum.at(["1000", "100", "10"], idx, "+Inf")
+  def upper_bound(idx, _), do: Enum.at([1000.0, 100.0, 10.0], idx, :infinity)
 
   @impl true
   def number_of_buckets(_), do: 3
+end
+
+defmodule Peep.Storage.RustNIFTest.StringBuckets do
+  @behaviour Peep.Buckets
+
+  @impl true
+  def config(_), do: %{}
+
+  @impl true
+  def boundaries(_), do: [10, 100]
+
+  @impl true
+  def bucket_for(_, _), do: 0
+
+  @impl true
+  def upper_bound(idx, _), do: Enum.at(["10", "100"], idx, :infinity)
+
+  @impl true
+  def number_of_buckets(_), do: 2
 end
 
 defmodule Peep.Storage.RustNIFTest do
@@ -209,6 +228,18 @@ defmodule Peep.Storage.RustNIFTest do
     )
   end
 
+  test "a calculator whose upper bounds aren't floats fails registration" do
+    Process.flag(:trap_exit, true)
+
+    dist =
+      Metrics.distribution("rustler.test.dist",
+        reporter_options: [peep_bucket_calculator: __MODULE__.StringBuckets]
+      )
+
+    assert {:error, {{:peep_storage_error, :bad_argument, _}, _}} =
+             Peep.start_link(name: Peep.Test.fresh_id(), storage: @storage, metrics: [dist])
+  end
+
   for value <- [1.0e19, -1.0e19, 1 <<< 64] do
     test "a distribution value of #{value} raises bad_measurement and stores nothing" do
       dist = powers_of_ten("rustler.test.dist")
@@ -231,7 +262,7 @@ defmodule Peep.Storage.RustNIFTest do
       metrics: [dist],
       ops: for(value <- [5, 50, 500, 5000], do: {:insert, {dist, value, %{}}}),
       exp_metrics: %{
-        dist => %{%{} => %{"10" => 1, "100" => 1, "1000" => 1, :infinity => 1, :sum => 5555}}
+        dist => %{%{} => %{10.0 => 1, 100.0 => 1, 1000.0 => 1, :infinity => 1, :sum => 5555}}
       }
     )
   end
@@ -348,8 +379,8 @@ defmodule Peep.Storage.RustNIFTest do
     )
   end
 
-  # A scraped distribution series: every bucket of `dist`, labelled by its
-  # calculator, with `counts` replacing zeros.
+  # A scraped distribution series: every bucket of `dist`, keyed by its
+  # upper bound, with `counts` replacing zeros.
   defp buckets(dist, counts, sum) do
     {mod, config} = Peep.Buckets.config(dist)
 

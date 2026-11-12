@@ -90,7 +90,7 @@ fn new(_opts: Term) -> ResourceArc<Storage> {
     })
 }
 
-// Copies bucket labels into environments of their own.
+// Decodes every metric and allocates its shards.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rustler::Error> {
     let registered = Registered {

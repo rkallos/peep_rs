@@ -257,8 +257,8 @@ impl Metric {
         with_shards!(&self.0, shards => largest(shards))
     }
 
-    /// Encodes this metric's merged series. A distribution's encoder copies
-    /// its bucket labels into `env` up front, to share them across series.
+    /// Encodes this metric's merged series. A distribution's encoder makes
+    /// its bucket keys in `env` up front, to share them across series.
     pub fn encoder<'a>(&self, env: Env<'a>) -> SeriesEncoder<'a> {
         SeriesEncoder {
             buckets: match &self.0 {
