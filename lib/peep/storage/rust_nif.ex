@@ -1,5 +1,24 @@
 defmodule Peep.Storage.RustNIF do
-  use Rustler, otp_app: :peep_rs, crate: "peep_storage_rustler"
+  version = Mix.Project.config()[:version]
+
+  # Downloads the NIF built for this platform by .github/workflows/release.yml.
+  # PEEP_RS_BUILD=1 builds it from source instead, which needs Cargo.
+  use RustlerPrecompiled,
+    otp_app: :peep_rs,
+    crate: "peep_storage_rustler",
+    version: version,
+    base_url: "https://github.com/rkallos/peep_rs/releases/download/v#{version}",
+    force_build: System.get_env("PEEP_RS_BUILD") in ["1", "true"],
+    # enif_term_size requires OTP 29 / NIF 2.18.
+    nif_versions: ["2.18"],
+    targets: ~w(
+      aarch64-apple-darwin
+      aarch64-unknown-linux-gnu
+      aarch64-unknown-linux-musl
+      x86_64-apple-darwin
+      x86_64-unknown-linux-gnu
+      x86_64-unknown-linux-musl
+    )
 
   @behaviour Peep.Storage
 

@@ -31,3 +31,7 @@ peep_rs-*.tar
 
 # direnv
 /.direnv/
+
+# Written by `mix rustler_precompiled.download` for a release, and shipped in
+# the Hex package only.
+/checksum-*.exs
