@@ -3,5 +3,7 @@ resolver = "2"
 
 members = ["native/peep_storage_rustler"]
 
-[patch.crates-io]
-rustler = { git = "https://github.com/rkallos/rustler.git", rev = "1eb6b6679bac7dee7a2dbd15579ac73536558577" }
+# Cross-crate inlining; retain unwinding for Rustler's panic handler.
+[profile.release]
+lto = true
+codegen-units = 1

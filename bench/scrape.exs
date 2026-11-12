@@ -1,0 +1,78 @@
+# Scrape cost for Peep.Storage.RustNIF.
+#
+# A counter, a sum, a last_value and two distributions share `--series` tags
+# maps, each inserted from every scheduler. One distribution uses
+# Peep.Buckets.PowersOfTen (11 keys per bucket map), the other the default
+# exponential buckets up to 1000 (38 keys). Erlang builds maps of up to 32 keys
+# differently from larger ones.
+#
+#     elixir bench/scrape.exs [--series N]
+#
+# To compare revisions, run each with `--save PATH --tag NAME`, then run the
+# last one with `--load PATH` as well.
+
+Mix.install([{:peep_rs, path: Path.expand("..", __DIR__)}, {:benchee, "~> 1.5"}])
+
+alias Telemetry.Metrics
+
+# Closures in a script are evaluated by `erl_eval`, so the timed call lives in
+# a compiled module.
+defmodule Scrape do
+  def run(storage, persistent), do: Peep.Storage.RustNIF.get_all_metrics(storage, persistent)
+end
+
+{opts, _, _} =
+  OptionParser.parse(System.argv(),
+    strict: [series: :integer, save: :string, tag: :string, load: :string]
+  )
+
+series = Keyword.get(opts, :series, 5000)
+
+metrics = [
+  Metrics.counter("bench.scrape.counter", tags: [:route]),
+  Metrics.sum("bench.scrape.sum", tags: [:route]),
+  Metrics.last_value("bench.scrape.gauge", tags: [:route]),
+  Metrics.distribution("bench.scrape.small",
+    tags: [:route],
+    reporter_options: [peep_bucket_calculator: Peep.Buckets.PowersOfTen]
+  ),
+  Metrics.distribution("bench.scrape.large", tags: [:route], reporter_options: [max_value: 1000])
+]
+
+name = :scrape_bench
+{:ok, _} = Peep.start_link(name: name, storage: {Peep.Storage.RustNIF, []}, metrics: metrics)
+persistent = Peep.Persistent.fetch(name)
+{Peep.Storage.RustNIF = mod, storage} = Peep.Persistent.storage(name)
+
+batch =
+  persistent
+  |> Peep.Persistent.ids_to_metrics()
+  |> Tuple.to_list()
+  |> Enum.with_index(fn metric, id -> {id, metric, 27, 0} end)
+
+# One process bound to each scheduler inserts every series, so each scheduler
+# thread's shard holds them all.
+# The `:scheduler` process flag is undocumented but stable.
+1..System.schedulers_online()
+|> Enum.map(fn scheduler ->
+  Task.async(fn ->
+    :erlang.process_flag(:scheduler, scheduler)
+
+    for i <- 1..series do
+      :ok = mod.insert_metrics(mod.resolve(storage), {%{route: "/items/#{i}"}}, batch)
+    end
+  end)
+end)
+|> Task.await_many(:infinity)
+
+comparison =
+  Enum.flat_map(opts, fn
+    {:save, path} -> [save: [path: path, tag: Keyword.get(opts, :tag, "run")]]
+    {:load, path} -> [load: path]
+    _ -> []
+  end)
+
+Benchee.run(
+  %{"get_all_metrics/2" => fn -> Scrape.run(storage, persistent) end},
+  [warmup: 2, time: 10] ++ comparison
+)

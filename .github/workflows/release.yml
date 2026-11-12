@@ -1,0 +1,126 @@
+name: Build precompiled NIFs
+
+on:
+  push:
+    tags:
+      - "v*"
+  # A manual run builds and tests every target but publishes nothing: the
+  # release steps run only for a tag. The archives are kept as workflow
+  # artifacts either way.
+  workflow_dispatch:
+
+jobs:
+  create_release:
+    name: Create GitHub release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Check the tag matches mix.exs
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION=$(sed -n 's/^  @version "\(.*\)"/\1/p' mix.exs | head -n1)
+          if [ "v${VERSION}" != "${{ github.ref_name }}" ]; then
+            echo "::error::tag ${{ github.ref_name }} does not match mix.exs version ${VERSION}"
+            exit 1
+          fi
+
+      # scripts/release.sh publishes the draft once every target has built.
+      - name: Create draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --draft
+
+  build_release:
+    name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }}
+    needs: create_release
+    runs-on: ${{ matrix.job.os }}
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # enif_term_size requires OTP 29 / NIF 2.18.
+        nif: ["2.18"]
+        # test: true where the runner can load the library it builds. The gnu
+        # targets build on the oldest runner image, as a library linked against
+        # an older glibc loads on a newer one but not the reverse.
+        job:
+          - { target: aarch64-apple-darwin, os: macos-15, test: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, test: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, test: true }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, test: true }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Extract project version
+        shell: bash
+        run: |
+          echo "PROJECT_VERSION=$(sed -n 's/^  @version "\(.*\)"/\1/p' mix.exs | head -n1)" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.job.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-precomp
+          shared-key: ${{ matrix.job.target }}-${{ matrix.nif }}
+
+      # project-dir is the workspace root, where Cargo puts target/.
+      - name: Build the NIF
+        id: build
+        uses: philss/rustler-precompiled-action@v1.1.5
+        with:
+          project-name: peep_storage_rustler
+          project-version: ${{ env.PROJECT_VERSION }}
+          target: ${{ matrix.job.target }}
+          nif-version: ${{ matrix.nif }}
+          use-cross: ${{ matrix.job.use-cross }}
+          project-dir: "./"
+
+      - name: Install Erlang and Elixir
+        if: matrix.job.test
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          elixir-version: "1.20"
+
+      # Runs the suite against the exact library this job ships. The compile
+      # builds a throwaway NIF from source, which the shipped one replaces.
+      - name: Test the built library
+        if: matrix.job.test
+        shell: bash
+        env:
+          PEEP_RS_BUILD: "1"
+          MIX_ENV: test
+        run: |
+          set -euo pipefail
+          mix deps.get
+          mix compile
+          tar -xzOf "${{ steps.build.outputs.file-path }}" > priv/native/peep_storage_rustler.so
+          mix test --no-compile
+
+      - name: Keep the archive as a workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.build.outputs.file-name }}
+          path: ${{ steps.build.outputs.file-path }}
+
+      - name: Upload to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "${{ steps.build.outputs.file-path }}" --repo "${{ github.repository }}" --clobber

@@ -22,7 +22,11 @@
             pkgs.rustc
             pkgs.cargo
             pkgs.clippy
+            pkgs.rustfmt
           ];
+
+          # Build the NIF from source rather than download a release's.
+          PEEP_RS_BUILD = "1";
         };
       }
     );
