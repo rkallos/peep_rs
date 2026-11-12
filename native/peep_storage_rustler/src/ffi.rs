@@ -1,8 +1,9 @@
 //! Safe wrappers over the erl_nif calls Rustler doesn't wrap the way this
 //! crate needs.
 
-use rustler::sys::{enif_get_double, enif_is_identical, enif_system_info, ErlNifSysInfo};
-use rustler::wrapper::NIF_TERM;
+use rustler::sys::{
+    enif_get_double, enif_get_tuple, enif_is_identical, enif_system_info, ErlNifSysInfo, ErlNifTerm,
+};
 use rustler::{Env, Term};
 use std::mem::size_of;
 
@@ -16,7 +17,7 @@ pub fn scheduler_count() -> usize {
 
 /// Whether two terms are `=:=`. The terms may belong to different
 /// environments, as long as both are live.
-pub fn terms_identical(a: NIF_TERM, b: NIF_TERM) -> bool {
+pub fn terms_identical(a: ErlNifTerm, b: ErlNifTerm) -> bool {
     a == b || unsafe { enif_is_identical(a, b) == 1 }
 }
 
@@ -34,14 +35,25 @@ pub fn term_as_f64(term: Term) -> Option<f64> {
 /// `rustler::types::tuple::get_tuple` does.
 pub struct TupleElements<'a> {
     env: Env<'a>,
-    elements: &'a [NIF_TERM],
+    elements: &'a [ErlNifTerm],
 }
 
 impl<'a> TupleElements<'a> {
     pub fn new(tuple: Term<'a>) -> Option<Self> {
         let env = tuple.get_env();
-        let elements =
-            unsafe { rustler::wrapper::tuple::get_tuple(env.as_c_arg(), tuple.as_c_arg()) }.ok()?;
+        let mut arity = 0;
+        let mut first = std::ptr::null();
+        let found =
+            unsafe { enif_get_tuple(env.as_c_arg(), tuple.as_c_arg(), &mut arity, &mut first) };
+        if found != 1 {
+            return None;
+        }
+
+        // An empty tuple's pointer need not be one a slice can be made from.
+        let elements = match usize::try_from(arity) {
+            Ok(arity) if arity > 0 => unsafe { std::slice::from_raw_parts(first, arity) },
+            _ => &[],
+        };
         Some(TupleElements { env, elements })
     }
 

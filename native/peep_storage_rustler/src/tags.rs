@@ -26,8 +26,8 @@ use crate::term_store::TermStore;
 use hashbrown::hash_map::HashMap;
 use hashbrown::HashSet;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard};
+use rustler::sys::ErlNifTerm;
 use rustler::types::map::MapIterator;
-use rustler::wrapper::NIF_TERM;
 use rustler::{Env, Term};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::mem::size_of;
@@ -235,7 +235,7 @@ impl Doomed {
 #[derive(Clone, Copy)]
 pub struct TagsKey {
     hash: u64,
-    term: NIF_TERM,
+    term: ErlNifTerm,
 }
 
 impl TagsKey {

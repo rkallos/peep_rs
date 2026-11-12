@@ -2,8 +2,7 @@
 //! that handed them over.
 
 use rustler::env::OwnedEnv;
-use rustler::sys::enif_make_copy;
-use rustler::wrapper::NIF_TERM;
+use rustler::sys::{enif_make_copy, ErlNifTerm};
 use rustler::{Env, Term};
 
 /// An environment of its own that stored terms live in. An environment has no
@@ -24,16 +23,16 @@ impl TermStore {
         TermStore(OwnedEnv::new())
     }
 
-    pub fn store(&mut self, term: NIF_TERM) -> NIF_TERM {
+    pub fn store(&mut self, term: ErlNifTerm) -> ErlNifTerm {
         self.0
             .run(|owned| unsafe { enif_make_copy(owned.as_c_arg(), term) })
     }
 
-    pub fn copy_out<'a>(&self, env: Env<'a>, term: NIF_TERM) -> Term<'a> {
+    pub fn copy_out<'a>(&self, env: Env<'a>, term: ErlNifTerm) -> Term<'a> {
         unsafe { Term::new(env, enif_make_copy(env.as_c_arg(), term)) }
     }
 
-    pub fn size_of(&self, term: NIF_TERM) -> usize {
+    pub fn size_of(&self, term: ErlNifTerm) -> usize {
         self.0.run(|owned| unsafe { Term::new(owned, term) }.size())
     }
 }

@@ -144,8 +144,9 @@ dependencies = [
 
 [[package]]
 name = "rustler"
-version = "0.38.0"
-source = "git+https://github.com/rusterlium/rustler.git?rev=0ba085adabd26632506aeeb3fae7534c9eff96d1#0ba085adabd26632506aeeb3fae7534c9eff96d1"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5256cd1465ad8c5450ee3392263375108cb70382be09dac76ae7da521446bdde"
 dependencies = [
  "inventory",
  "libc",
@@ -155,11 +156,11 @@ dependencies = [
 
 [[package]]
 name = "rustler_codegen"
-version = "0.38.0"
-source = "git+https://github.com/rusterlium/rustler.git?rev=0ba085adabd26632506aeeb3fae7534c9eff96d1#0ba085adabd26632506aeeb3fae7534c9eff96d1"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "976aaa45a28908eb2433b1afc70bf8c39eabd0ee45e8de24b2ae53dfb8876b84"
 dependencies = [
  "heck",
- "inventory",
  "proc-macro2",
  "quote",
  "syn",

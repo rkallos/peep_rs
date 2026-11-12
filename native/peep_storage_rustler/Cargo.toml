@@ -11,4 +11,4 @@ crate-type = ["cdylib"]
 hashbrown = "0.17.1"
 parking_lot = "0.12"
 # enif_term_size requires OTP 29 / NIF 2.18.
-rustler = { version = "0.38.0", features = ["nif_version_2_18"] }
+rustler = { version = "0.39.0", features = ["nif_version_2_18"] }
